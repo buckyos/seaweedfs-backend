@@ -1,0 +1,3 @@
+[submodule "seaweedfs"]
+	path = seaweedfs
+	url = https://github.com/seaweedfs/seaweedfs.git
