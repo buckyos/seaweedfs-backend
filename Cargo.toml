@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "dfs-mount",
+    "dfs-common"
+]
+
+[dependencies]
+tonic = "0.11"
+prost = "0.12"  # Protocol Buffers 支持
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }  # 异步运行时
+
+[build-dependencies]
+tonic-build = "0.11"  # 用于编译 .proto 文件 
