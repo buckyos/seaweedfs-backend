@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0"
 fuser = "0.15"
-libc = "0.2"        # fuser需要这个依赖 
+libc = "0.2"   
 dfs-common = { path = "../common" }

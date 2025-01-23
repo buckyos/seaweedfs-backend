@@ -1,3 +1,8 @@
+#![allow(dead_code)]
+
+mod file_handle;
+mod weedfs;
+
 use std::ffi::OsStr;
 use std::time::{Duration, SystemTime};
 use fuser::{

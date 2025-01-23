@@ -1,3 +1,1 @@
-mod filer_pb;
-
-pub use filer_pb::*;
+pub mod filer_pb;
