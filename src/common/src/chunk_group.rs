@@ -1,16 +1,55 @@
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::RwLock;
 use anyhow::{Result, Error};
 use crate::pb::filer_pb::FileChunk;
 use crate::chunks;
+use crate::interval_list::{IntervalList, IntervalValue};
+use crate::reader_cache::ReaderCache;
 
 pub type SectionIndex = u64;
 const SECTION_SIZE: u64 = 2 * 1024 * 1024 * 32; // 64MiB
-pub struct FileChunkSection {
-    pub section_index: SectionIndex,
-    pub chunks: Vec<FileChunk>,
 
+#[derive(Clone)]
+struct VisibleInterval {
+    range: Range<i64>,
+    modified_ts_ns: i64,
+    file_id: String,
+    offset_in_chunk: i64,
+    chunk_size: u64,
+}
+
+impl IntervalValue for VisibleInterval {
+    fn set_range(&mut self, range: Range<i64>) {
+        self.offset_in_chunk += range.start - self.range.start;
+        self.range = range;
+    }
+}
+
+#[derive(Clone)]
+struct ChunkView {
+    file_id: String,
+    offset_in_chunk: i64,
+    view_size: u64,
+    view_offset: i64,
+    chunk_size: u64,
+    modified_ts_ns: i64,
+}
+
+impl IntervalValue for ChunkView {
+    fn set_range(&mut self, range: Range<i64>) {
+        self.offset_in_chunk += range.start - self.view_offset;
+        self.view_offset = range.start;
+        self.view_size = (range.end - range.start) as u64;
+    }
+}
+
+struct FileChunkSection {
+    section_index: SectionIndex,
+    chunks: Vec<FileChunk>,
+    visible_intervals: IntervalList<VisibleInterval>,
+    chunk_views: IntervalList<ChunkView>,
 }
 
 impl FileChunkSection {
@@ -19,6 +58,7 @@ impl FileChunkSection {
     }
 }
 
+// file -> section -> chunk
 pub struct ChunkGroup {
     sections: RwLock<BTreeMap<SectionIndex, FileChunkSection>>,
 }
@@ -52,6 +92,8 @@ impl ChunkGroup {
                     let section = FileChunkSection {
                         section_index: si,
                         chunks: vec![chunk.clone()],
+                        visible_intervals: IntervalList::new(),
+                        chunk_views: IntervalList::new(),
                     };
                     sections.insert(si, section);
                 }

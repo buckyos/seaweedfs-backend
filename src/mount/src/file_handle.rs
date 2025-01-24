@@ -85,7 +85,6 @@ impl FileHandle {
             if offset as u64 > file_size {
                 return Ok((0, 0))
             }
-
             if offset < entry_and_chunks.entry.content.len() as i64 {
                 buff.copy_from_slice(&entry_and_chunks.entry.content[offset as usize..]);
                 let total_read = entry_and_chunks.entry.content.len() - offset as usize;

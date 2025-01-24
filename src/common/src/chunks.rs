@@ -5,6 +5,8 @@ use std::{io::Cursor, ops::Range};
 use std::io::Write;
 use prost::Message;
 use crate::pb::filer_pb::{Entry, FileChunk, FileChunkManifest};
+use ureq::{Agent, AgentBuilder};
+use std::time::Duration;
 
 thread_local! {
     static RESOLVE_CHUNK_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 1024));
@@ -53,8 +55,6 @@ pub fn retried_stream_fetch_chunk_data(
     writer: impl Write,
     url_strings: Vec<String>,
     jwt: &str,
-    cipher_key: &[u8],
-    is_gziped: bool,
     is_full_chunk: bool,
     offset: i64,
     size: i64
@@ -65,12 +65,12 @@ pub fn retried_stream_fetch_chunk_data(
 fn fetch_whole_chunk(
     lookup: impl Fn(&str) -> Result<Vec<String>>, 
     chunks_buffer: &mut [u8],
-    file_id: &str, cipher_key: &[u8], is_gziped: bool
+    file_id: &str
 ) -> Result<()> {
     let url_strings = lookup(file_id)?;
     retried_stream_fetch_chunk_data(
         Cursor::new(chunks_buffer), 
-        url_strings, "", cipher_key, is_gziped, true, 0, 0)
+        url_strings, "",true, 0, 0)
 }
 
 // resolve one chunk manifest
@@ -84,7 +84,7 @@ pub fn resolve_chunk_manifest(
     
     let manifest = RESOLVE_CHUNK_BUFFER.with(|buf| {
         let mut buf = buf.borrow_mut();
-        fetch_whole_chunk(lookup, &mut buf[..], &chunk.file_id, &chunk.cipher_key, chunk.is_compressed)?;
+        fetch_whole_chunk(lookup, &mut buf[..], &chunk.file_id)?;
         FileChunkManifest::decode(&buf[..]).map_err(|e| anyhow::anyhow!("failed to decode manifest: {}", e))
     })?;
 
@@ -123,3 +123,53 @@ pub fn resolve_chunks_manifest(
     }
     Ok((data_chunks, manifest_chunks))
 }
+
+pub fn retried_fetch_chunk_data(
+    buffer: &mut [u8],
+    url_strings: Vec<String>,
+    is_full_chunk: bool,
+    offset: i64,
+) -> Result<usize> {
+    let agent = AgentBuilder::new()
+        .timeout_read(Duration::from_secs(30))
+        .build();
+    let mut last_err = None;
+    let mut wait_time = Duration::from_secs(1);
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+
+    while wait_time < MAX_WAIT {
+        for url in &url_strings {
+            let mut req = agent.get(url);
+
+            if !is_full_chunk {
+                req = req.set("Range", &format!("bytes={}-{}", offset, offset + buffer.len() as i64 - 1));
+            }
+
+            match req.call() {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !(200..300).contains(&status) {
+                        if status >= 500 {
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("{}: {}", url, status));
+                    }
+
+                    let n = resp.into_reader().read(buffer)?;
+                    return Ok(n);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        std::thread::sleep(wait_time);
+        wait_time *= 2;
+    }
+
+    Err(anyhow::anyhow!("failed after retries: {:?}", last_err))
+}
+
+
