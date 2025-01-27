@@ -8,3 +8,5 @@ mod reader_cache;
 pub use chunk_group::ChunkGroup;
 pub use page_writer::*;
 pub use interval_list::*;
+pub use chunk_cache::*;
+pub use reader_cache::*;

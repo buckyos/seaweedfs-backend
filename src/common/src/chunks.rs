@@ -5,8 +5,12 @@ use std::{io::Cursor, ops::Range};
 use std::io::Write;
 use prost::Message;
 use crate::pb::filer_pb::{Entry, FileChunk, FileChunkManifest};
-use ureq::{Agent, AgentBuilder};
+use ureq::{AgentBuilder};
 use std::time::Duration;
+
+pub trait LookupFileId {
+    fn lookup(&self, file_id: &str) -> Result<Vec<String>>;
+}
 
 thread_local! {
     static RESOLVE_CHUNK_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 1024));
@@ -51,31 +55,33 @@ pub fn separate_manifest_chunks(chunks: Vec<FileChunk>) -> (Vec<FileChunk>, Vec<
     (manifest_chunks, non_manifest_chunks)
 }
 
-pub fn retried_stream_fetch_chunk_data(
-    writer: impl Write,
-    url_strings: Vec<String>,
-    jwt: &str,
-    is_full_chunk: bool,
-    offset: i64,
-    size: i64
-) -> Result<()> {
-    unimplemented!()
-}
-
-fn fetch_whole_chunk(
-    lookup: impl Fn(&str) -> Result<Vec<String>>, 
+pub fn fetch_whole_chunk(
+    lookup: &impl LookupFileId, 
     chunks_buffer: &mut [u8],
     file_id: &str
 ) -> Result<()> {
-    let url_strings = lookup(file_id)?;
-    retried_stream_fetch_chunk_data(
+    let url_strings = lookup.lookup(file_id)?;
+    let size = chunks_buffer.len();
+    retried_fetch_chunk_data(
         Cursor::new(chunks_buffer), 
-        url_strings, "",true, 0, 0)
+        url_strings, true, 0, size)?;
+    Ok(())
+}
+
+pub fn fetch_chunk_range(
+    lookup: &impl LookupFileId, 
+    chunks_buffer: &mut [u8],
+    file_id: &str,
+    offset: i64
+) -> Result<usize> {
+    let size = chunks_buffer.len();
+    let url_strings = lookup.lookup(file_id)?;
+    retried_fetch_chunk_data(chunks_buffer, url_strings, false, offset, size)
 }
 
 // resolve one chunk manifest
 pub fn resolve_chunk_manifest(
-    lookup: impl Fn(&str) -> Result<Vec<String>>, 
+    lookup: &impl LookupFileId, 
     chunk: &FileChunk
 ) -> Result<Vec<FileChunk>> {
     if !chunk.is_chunk_manifest {
@@ -94,7 +100,7 @@ pub fn resolve_chunk_manifest(
 
 // resolve chunk manifest recursively
 pub fn resolve_chunks_manifest(
-    lookup: impl Clone + Fn(&str) -> Result<Vec<String>>, 
+    lookup: &impl LookupFileId, 
     chunks: Vec<FileChunk>, 
     offset_range: Range<i64>
 ) -> Result<(Vec<FileChunk>, Vec<FileChunk>)> {
@@ -125,10 +131,11 @@ pub fn resolve_chunks_manifest(
 }
 
 pub fn retried_fetch_chunk_data(
-    buffer: &mut [u8],
+    mut writer: impl Write,
     url_strings: Vec<String>,
     is_full_chunk: bool,
-    offset: i64,
+    offset: i64, 
+    size: usize
 ) -> Result<usize> {
     let agent = AgentBuilder::new()
         .timeout_read(Duration::from_secs(30))
@@ -142,7 +149,7 @@ pub fn retried_fetch_chunk_data(
             let mut req = agent.get(url);
 
             if !is_full_chunk {
-                req = req.set("Range", &format!("bytes={}-{}", offset, offset + buffer.len() as i64 - 1));
+                req = req.set("Range", &format!("bytes={}-{}", offset, offset + size as i64 - 1));
             }
 
             match req.call() {
@@ -155,8 +162,8 @@ pub fn retried_fetch_chunk_data(
                         return Err(anyhow::anyhow!("{}: {}", url, status));
                     }
 
-                    let n = resp.into_reader().read(buffer)?;
-                    return Ok(n);
+                    let n = std::io::copy(&mut resp.into_reader(), &mut writer)?;
+                    return Ok(n as usize);
                 }
                 Err(e) => {
                     last_err = Some(e);

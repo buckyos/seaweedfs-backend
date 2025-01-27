@@ -2,7 +2,7 @@ use std::collections::LinkedList;
 use std::ops::Range;
 
 pub trait IntervalValue: Clone {
-    fn set_range(&mut self, range: Range<i64>);
+    fn set_range(&mut self, old_range: Range<i64>, new_range: Range<i64>);
 }
 
 #[derive(Clone)]
@@ -14,6 +14,32 @@ pub struct Interval<T: IntervalValue> {
 
 pub struct IntervalList<T: IntervalValue> {
     inner: LinkedList<Interval<T>>,
+}
+
+impl<T: IntervalValue> FromIterator<Interval<T>> for IntervalList<T> {
+    fn from_iter<I: IntoIterator<Item = Interval<T>>>(iter: I) -> Self {
+        Self {
+            inner: iter.into_iter().collect(),
+        }
+    }
+}
+
+impl<'a, T: IntervalValue> IntoIterator for &'a IntervalList<T> {
+    type Item = &'a Interval<T>;
+    type IntoIter = std::collections::linked_list::Iter<'a, Interval<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter()
+    }
+}
+
+impl<'a, T: IntervalValue> IntoIterator for &'a mut IntervalList<T> {
+    type Item = &'a mut Interval<T>;
+    type IntoIter = std::collections::linked_list::IterMut<'a, Interval<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter_mut()
+    }
 }
 
 impl<T: IntervalValue> IntervalList<T> {
@@ -44,16 +70,18 @@ impl<T: IntervalValue> IntervalList<T> {
                 if current.range.start < interval.range.start {
                     // 左侧分割
                     let mut left = current.clone();
+                    let old_range = left.range.clone();
                     left.range = current.range.start..interval.range.start;
-                    left.value.set_range(left.range.clone());
+                    left.value.set_range(old_range, left.range.clone());
                     new_list.push_back(left);
                 }
                 
                 if current.range.end > interval.range.end {
                     // 右侧分割
                     let mut right = current.clone();
+                    let old_range = right.range.clone();
                     right.range = interval.range.end..current.range.end;
-                    right.value.set_range(right.range.clone());
+                    right.value.set_range(old_range, right.range.clone());
                     new_list.push_back(interval.clone());
                     new_list.push_back(right);
                     new_list.append(&mut rest);
@@ -92,28 +120,32 @@ impl<T: IntervalValue> IntervalList<T> {
             if current_interval.ts_ns >= current.ts_ns {
                 if current.range.start < current_interval.range.start {
                     let mut left = current.clone();
+                    let old_range = left.range.clone();
                     left.range = current.range.start..current_interval.range.start;
-                    left.value.set_range(left.range.clone());
+                    left.value.set_range(old_range, left.range.clone());
                     new_list.push_back(left);
                 }
                 if current_interval.range.end < current.range.end {
                     let new_range = current_interval.range.end..current.range.end;
-                    current_interval.range = new_range;
-                    current_interval.value.set_range(current_interval.range.clone());
+                    let old_range = current.range.clone();
+                    current_interval.range = new_range.clone();
+                    current_interval.value.set_range(old_range, new_range);
                     break;
                 }
             } else {
                 if current_interval.range.start < current.range.start {
                     let mut left = current_interval.clone();
+                    let old_range = left.range.clone();
                     left.range = current_interval.range.start..current.range.start;
-                    left.value.set_range(left.range.clone());
+                    left.value.set_range(old_range, left.range.clone());
                     new_list.push_back(left);
                 }
                 new_list.push_back(current.clone());
                 if current.range.end < current_interval.range.end {
                     let new_range = current.range.end..current_interval.range.end;
-                    current_interval.range = new_range;
-                    current_interval.value.set_range(current_interval.range.clone());
+                    let old_range = current_interval.range.clone();
+                    current_interval.range = new_range.clone();
+                    current_interval.value.set_range(old_range, new_range);
                     continue;
                 }
                 self.inner = new_list;
@@ -124,5 +156,13 @@ impl<T: IntervalValue> IntervalList<T> {
         new_list.push_back(current_interval);
         new_list.append(&mut rest);
         self.inner = new_list;
+    }
+
+    pub fn iter(&self) -> std::collections::linked_list::Iter<'_, Interval<T>> {
+        self.inner.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::collections::linked_list::IterMut<'_, Interval<T>> {
+        self.inner.iter_mut()
     }
 }

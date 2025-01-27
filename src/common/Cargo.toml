@@ -9,6 +9,7 @@ prost = "0.13"
 anyhow = "1.0"
 lru = "0.12"
 ureq = "2.10"
+hex = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12" 

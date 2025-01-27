@@ -1,11 +1,29 @@
-use anyhow::Result;
 use std::cmp::min;
 use std::num::NonZero;
+use std::ops::Range;
 use std::sync::{Arc, RwLock, Mutex};
 use std::collections::HashMap;
 use lru::LruCache;
 use crate::chunk_cache::ChunkCache;
-use crate::chunks;
+use crate::chunks::{self, LookupFileId};
+use crate::interval_list::IntervalValue;
+
+#[derive(Clone)]
+pub struct ChunkView {
+    pub file_id: String,
+    pub offset_in_chunk: i64,
+    pub chunk_size: u64,
+    pub view_size: u64,
+    pub view_offset: i64,
+}
+
+impl IntervalValue for ChunkView {
+    fn set_range(&mut self, old_range: Range<i64>, new_range: Range<i64>) {
+        self.offset_in_chunk += new_range.start - old_range.start;
+        self.view_offset = new_range.start;
+        self.view_size = (new_range.end - new_range.start) as u64;
+    }
+}
 
 type Downloading = Arc<RwLock<Option<Arc<Vec<u8>>>>>;
 
@@ -45,9 +63,64 @@ impl<T: ChunkCache> ReaderCache<T> {
         }
     }
 
+    pub fn outer_cache(&self) -> &T {
+        &self.inner.outer_cache
+    }
+
+    pub fn uncache(&self, file_id: &str) {
+        let mut inner_cache = self.inner.inner_cache.lock().unwrap();
+        inner_cache.downloading.remove(file_id);
+        inner_cache.downloaded.pop(file_id);
+    }
+
+    pub fn maybe_cache<'a>(
+        &self, 
+        _lookup: &impl LookupFileId, 
+        _chunk_views: impl Iterator<Item = &'a ChunkView>
+    ) {
+        // TODO: implement
+        // if rc.lookupFileIdFn == nil {
+        //     return
+        // }
+    
+        // rc.Lock()
+        // defer rc.Unlock()
+    
+        // if len(rc.downloaders) >= rc.limit {
+        //     return
+        // }
+    
+        // for x := chunkViews; x != nil; x = x.Next {
+        //     chunkView := x.Value
+        //     if _, found := rc.downloaders[chunkView.FileId]; found {
+        //         continue
+        //     }
+        //     if rc.chunkCache.IsInCache(chunkView.FileId, true) {
+        //         glog.V(4).Infof("%s is in cache", chunkView.FileId)
+        //         continue
+        //     }
+    
+        //     if len(rc.downloaders) >= rc.limit {
+        //         // abort when slots are filled
+        //         return
+        //     }
+    
+        //     // glog.V(4).Infof("prefetch %s offset %d", chunkView.FileId, chunkView.ViewOffset)
+        //     // cache this chunk if not yet
+        //     shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= rc.chunkCache.GetMaxFilePartSizeInCache()
+        //     cacher := newSingleChunkCacher(rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
+        //     go cacher.startCaching()
+        //     <-cacher.cacheStartedCh
+        //     rc.downloaders[chunkView.FileId] = cacher
+    
+        // }
+    
+        // return
+    }
+
     pub fn read_at(
         &self, 
-        lookup: impl Fn(&str) -> Result<Vec<String>>, 
+        lookup: &impl LookupFileId, 
         buf: &mut [u8], 
         file_id: &str, 
         offset: usize, 
@@ -82,9 +155,11 @@ impl<T: ChunkCache> ReaderCache<T> {
             let new_downloading = Arc::new(RwLock::new(None));
             let mut downloading = new_downloading.write().unwrap();
             self.inner.inner_cache.lock().unwrap().downloading.insert(file_id.to_owned(), new_downloading.clone());
-            let url_strings = lookup(file_id).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+           
+            // TODO: use a buffer pool
             let mut data = vec![0u8; chunk_size];
-            chunks::retried_fetch_chunk_data(&mut data[..], url_strings, true, 0).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            chunks::fetch_whole_chunk(lookup, &mut data[..], file_id)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
             let data = Arc::new(data);
             if should_cache {
                 self.inner.outer_cache.set(file_id, data.clone());

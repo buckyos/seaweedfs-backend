@@ -1,77 +1,339 @@
 use std::cmp::{max, min};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
-use std::sync::RwLock;
-use anyhow::{Result, Error};
+use std::sync::{Mutex, RwLock};
+use anyhow::Result;
 use crate::pb::filer_pb::FileChunk;
-use crate::chunks;
-use crate::interval_list::{IntervalList, IntervalValue};
-use crate::reader_cache::ReaderCache;
-
+// use crate::pb::filer_pb_ext::FileIdExt;
+use crate::chunks::{self, LookupFileId};
+use crate::interval_list::{IntervalList, IntervalValue, Interval};
+use crate::reader_cache::{ReaderCache, ChunkView};
+use crate::chunk_cache::ChunkCache;
 pub type SectionIndex = u64;
 const SECTION_SIZE: u64 = 2 * 1024 * 1024 * 32; // 64MiB
 
 #[derive(Clone)]
 struct VisibleInterval {
-    range: Range<i64>,
-    modified_ts_ns: i64,
     file_id: String,
     offset_in_chunk: i64,
     chunk_size: u64,
 }
 
 impl IntervalValue for VisibleInterval {
-    fn set_range(&mut self, range: Range<i64>) {
-        self.offset_in_chunk += range.start - self.range.start;
-        self.range = range;
+    fn set_range(&mut self, old_range: Range<i64>, new_range: Range<i64>) {
+        self.offset_in_chunk += new_range.start - old_range.start;
     }
 }
 
-#[derive(Clone)]
-struct ChunkView {
-    file_id: String,
-    offset_in_chunk: i64,
-    view_size: u64,
-    view_offset: i64,
-    chunk_size: u64,
-    modified_ts_ns: i64,
+
+struct ReaderPattern {
+    is_sequential_counter: i64,
+    last_read_stop_offset: i64,
 }
 
-impl IntervalValue for ChunkView {
-    fn set_range(&mut self, range: Range<i64>) {
-        self.offset_in_chunk += range.start - self.view_offset;
-        self.view_offset = range.start;
-        self.view_size = (range.end - range.start) as u64;
-    }
-}
-
-struct FileChunkSection {
-    section_index: SectionIndex,
-    chunks: Vec<FileChunk>,
-    visible_intervals: IntervalList<VisibleInterval>,
-    chunk_views: IntervalList<ChunkView>,
-}
-
-impl FileChunkSection {
-    pub fn read_at(&self, file_size: u64, buf: &mut [u8], offset: u64) -> std::io::Result<(usize, u64)> {
-        Ok((0, 0))
-    }
-}
-
-// file -> section -> chunk
-pub struct ChunkGroup {
-    sections: RwLock<BTreeMap<SectionIndex, FileChunkSection>>,
-}
-
-impl ChunkGroup {
-    pub fn new() -> Self {
+impl ReaderPattern {
+    fn new() -> Self {
         Self {
-            sections: RwLock::new(BTreeMap::new()),
+            is_sequential_counter: 0,
+            last_read_stop_offset: 0,
         }
     }
 
-    pub fn set_chunks(&self, lookup: impl Clone + Fn(&str) -> Result<Vec<String>>, chunks: Vec<FileChunk>) -> Result<()> {
-        let mut sections = self.sections.write().unwrap();
+    fn mode_change_limit() -> i64 {
+        3
+    }
+
+    fn monitor_read_at(&mut self, offset: i64, size: usize) {
+        let last_offset = self.last_read_stop_offset;
+        self.last_read_stop_offset = offset + size as i64;
+        if last_offset == offset {
+            if self.is_sequential_counter < Self::mode_change_limit() {
+                self.is_sequential_counter += 1;
+            }
+        } else {
+            if self.is_sequential_counter > -Self::mode_change_limit() {
+                self.is_sequential_counter -= 1;
+            }
+        }
+    }
+
+    fn is_random_mode(&self) -> bool {
+        self.is_sequential_counter < 0
+    }
+}
+
+struct SectionMutPart {
+    reader_pattern: ReaderPattern,
+    last_chunk_fid: Option<String>,
+}
+struct FileChunkSection {
+    section_index: SectionIndex,
+    chunks: Vec<FileChunk>,
+    visibles: IntervalList<VisibleInterval>,
+    chunk_views: IntervalList<ChunkView>, 
+    reader_pattern: ReaderPattern,
+    mut_part: Mutex<SectionMutPart>,
+}
+
+impl FileChunkSection {
+    fn new(section_index: SectionIndex, chunks: Vec<FileChunk>) -> Self {
+        let visibles = Self::read_resolved_chunks(&chunks, (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64);
+        let visables = visibles.iter().map(|visable| &visable.value.file_id).collect::<HashSet<_>>();
+        let (compacted, _) = chunks.into_iter().partition(|chunk| visables.contains(&chunk.file_id));
+        let chunk_views = visibles.iter().filter_map(|visable| {
+            if visable.value.offset_in_chunk >= (section_index * SECTION_SIZE) as i64 && visable.value.offset_in_chunk < ((section_index + 1) * SECTION_SIZE) as i64 {
+                Some(Interval {
+                    ts_ns: visable.ts_ns,
+                    value: ChunkView {
+                        file_id: visable.value.file_id.clone(),
+                        offset_in_chunk: visable.value.offset_in_chunk - (section_index * SECTION_SIZE) as i64,
+                        chunk_size: visable.value.chunk_size,
+                        view_size: visable.value.chunk_size,
+                        view_offset: visable.value.offset_in_chunk,
+                    },
+                    range: visable.value.offset_in_chunk..visable.value.offset_in_chunk + visable.value.chunk_size as i64,
+                })
+            } else {
+                None
+            }
+        }).collect();
+        
+        Self {
+            visibles,
+            chunk_views,
+            section_index,
+            chunks: compacted,
+            reader_pattern: ReaderPattern::new(), 
+            mut_part: Mutex::new(SectionMutPart {
+                reader_pattern: ReaderPattern::new(),
+                last_chunk_fid: None,
+            }),
+        }
+    }
+
+    fn read_resolved_chunks(chunks: &[FileChunk], range: Range<i64>) -> IntervalList<VisibleInterval> {
+        #[derive(Clone)]
+        struct Point<'a> {
+            x: i64,
+            ts: i64,
+            chunk: &'a FileChunk,
+            is_start: bool,
+        }
+
+        // 收集所有点
+        let mut points = Vec::new();
+        for chunk in chunks {
+            let range = max(chunk.offset, range.start)..min(chunk.offset + chunk.size as i64, range.end);
+            points.push(Point {
+                x: chunk.offset,
+                ts: chunk.modified_ts_ns,
+                chunk,
+                is_start: true,
+            });
+            points.push(Point {
+                x: chunk.offset + chunk.size as i64,
+                ts: chunk.modified_ts_ns,
+                chunk,
+                is_start: false,
+            });
+        }
+
+        // 排序点
+        points.sort_by(|a, b| {
+            if a.x != b.x {
+                return a.x.cmp(&b.x);
+            }
+            if a.ts != b.ts {
+                return a.ts.cmp(&b.ts);
+            }
+            if a.is_start {
+                return std::cmp::Ordering::Greater;
+            }
+            std::cmp::Ordering::Less
+        });
+
+        let mut queue: Vec<Point> = Vec::new();
+        let mut prev_x = 0;
+        let mut visible_intervals = IntervalList::new();
+
+        for point in &points {
+            if point.is_start {
+                if let Some(prev_point) = queue.last() {
+                    if point.x != prev_x && prev_point.ts < point.ts {
+                        let chunk = prev_point.chunk;
+                        visible_intervals.push_back(Interval {
+                            range: prev_x..point.x,
+                            ts_ns: chunk.modified_ts_ns,
+                            value: VisibleInterval {
+                                file_id: chunk.file_id.to_string(),
+                                offset_in_chunk: prev_x - chunk.offset,
+                                chunk_size: chunk.size,
+                            },
+                        });
+                        prev_x = point.x;
+                        continue;
+                    } else if prev_point.ts < point.ts {
+                        queue.push(point.clone());
+                        prev_x = point.x;
+                        continue;
+                    }
+                }
+
+                // 找到合适的插入位置
+                let pos = queue.binary_search_by(|p| p.ts.cmp(&point.ts))
+                    .unwrap_or_else(|e| e);
+                queue.insert(pos, point.clone());
+            } else {
+                // 找到并移除对应的点
+                if let Some(pos) = queue.iter().position(|p| p.ts == point.ts) {
+                    queue.remove(pos);
+                    if pos == queue.len() {
+                        if let Some(prev_point) = queue.last() {
+                            let chunk = prev_point.chunk;
+                            visible_intervals.push_back(Interval {
+                                range: prev_x..point.x,
+                                ts_ns: chunk.modified_ts_ns,
+                                value: VisibleInterval {
+                                    file_id: chunk.file_id.to_string(),
+                                    offset_in_chunk: prev_x - chunk.offset,
+                                    chunk_size: chunk.size,
+                                },
+                            });
+                            prev_x = point.x;
+                        }
+                    }
+                }
+            }
+        }
+
+        visible_intervals
+    }
+
+    fn read_chunk_slice_at<'a, T: ChunkCache>(
+        &self, 
+        lookup: &impl LookupFileId, 
+        reader_cache: &ReaderCache<T>, 
+        buf: &mut [u8], 
+        chunk_view: &ChunkView, 
+        next_chunk_views: impl Iterator<Item = &'a ChunkView>,
+        offset: u64
+    ) -> std::io::Result<usize> {
+        let mut mut_part = self.mut_part.lock().unwrap();
+        if mut_part.reader_pattern.is_random_mode() {
+            match reader_cache.outer_cache().read(buf, &chunk_view.file_id, offset as usize) {
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    match e.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            return chunks::fetch_chunk_range(lookup, buf, &chunk_view.file_id, offset as i64)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            }
+        } else {
+            let should_cache = (chunk_view.view_offset as u64 + chunk_view.view_size) <= reader_cache.outer_cache().max_file_part_size();
+            let read = reader_cache.read_at(lookup, buf, &chunk_view.file_id, offset as usize, chunk_view.view_size as usize, should_cache)?;
+            if mut_part.last_chunk_fid.is_none() || mut_part.last_chunk_fid.as_ref().unwrap() != &chunk_view.file_id {
+                if let Some(last_chunk_fid) = mut_part.last_chunk_fid.as_ref() {
+                    reader_cache.uncache(last_chunk_fid);
+                }
+                reader_cache.maybe_cache(lookup, next_chunk_views);
+            }
+            mut_part.last_chunk_fid = Some(chunk_view.file_id.clone());
+            return Ok(read);
+        }
+    }
+
+    fn read_at<T: ChunkCache>(
+        &self, 
+        lookup: &impl LookupFileId, 
+        file_size: u64,
+        reader_cache: &ReaderCache<T>, 
+        buf: &mut [u8], 
+        offset: i64
+    ) -> std::io::Result<(usize, u64)> {
+        {
+            let mut mut_part = self.mut_part.lock().unwrap();
+            mut_part.reader_pattern.monitor_read_at(offset, buf.len() as usize);
+        }
+
+        let mut start = offset;
+        let mut read = 0;
+        let mut ts_ns = 0;
+        let mut remaining = buf.len() as i64;
+        for (i, view) in self.chunk_views.iter().enumerate() {
+            if start < view.value.view_offset {
+                let gap = (view.value.view_offset - start) as usize;
+                buf[(start - offset) as usize..(start - offset) as usize + gap].fill(0);
+                start = view.value.view_offset;
+                read += gap;
+                remaining -= gap as i64;
+                if remaining <= 0 {
+                    break;
+                }
+            }
+
+            let chunk_range = max(view.value.view_offset, start)..min(view.value.view_offset + view.value.view_size as i64, start + remaining);
+            ts_ns = view.ts_ns;
+            let chunk_offset = chunk_range.start - view.value.view_offset + view.value.offset_in_chunk;
+            let n = self.read_chunk_slice_at(
+                lookup, 
+                reader_cache, 
+                &mut buf[(start - offset) as usize..(start - offset) as usize + (chunk_range.end - chunk_range.start) as usize], 
+                &view.value, 
+                self.chunk_views.iter().skip(i + 1).map(|v| &v.value),
+                chunk_offset as u64
+            )?;
+            start += n as i64;
+            remaining -= n as i64;
+            read += n;
+            if remaining <= 0 {
+                break;
+            }
+        }
+
+        if remaining > 0 {
+            let delta = min(remaining as usize, (file_size - start as u64) as usize);
+            buf[(start - offset) as usize..(start - offset) as usize + delta].fill(0);
+            read += delta;
+        }
+
+        Ok((read, ts_ns as u64))
+
+    }
+}
+
+struct SectionsAndFileSize {
+    sections: BTreeMap<SectionIndex, FileChunkSection>,
+    file_size: u64,
+}
+
+// file -> section -> chunk
+pub struct ChunkGroup<T: ChunkCache> {
+    mut_part: RwLock<SectionsAndFileSize>, 
+    reader_cache: ReaderCache<T>,
+}
+
+impl<T: ChunkCache> ChunkGroup<T> {
+    pub fn new(chunk_cache: T) -> Self {
+        Self {
+            mut_part: RwLock::new(SectionsAndFileSize {
+                sections: BTreeMap::new(),
+                file_size: 0,
+            }),
+            reader_cache: ReaderCache::new(chunk_cache),
+        }
+    }
+
+    pub fn set_chunks(
+        &self, 
+        lookup: &impl LookupFileId, 
+        file_size: u64,
+        chunks: Vec<FileChunk>
+    ) -> Result<()> {
+        let mut sections: BTreeMap<SectionIndex, Vec<FileChunk>> = BTreeMap::new();
         let mut data_chunks = Vec::new();
         for chunk in chunks {
             if !chunk.is_chunk_manifest {
@@ -82,39 +344,49 @@ impl ChunkGroup {
             let mut resolved_chunks = chunks::resolve_chunk_manifest(lookup.clone(), &chunk)?;
             data_chunks.append(&mut resolved_chunks);
         }   
-
         for chunk in data_chunks {
             let index_range = chunk.offset as u64 / SECTION_SIZE..(chunk.offset as u64 + chunk.size) / SECTION_SIZE + 1;
             for si in index_range {
                 if let Some(section) = sections.get_mut(&si) {
-                    section.chunks.push(chunk.clone());
+                    section.push(chunk.clone());
                 } else {
-                    let section = FileChunkSection {
-                        section_index: si,
-                        chunks: vec![chunk.clone()],
-                        visible_intervals: IntervalList::new(),
-                        chunk_views: IntervalList::new(),
-                    };
+                    let section = vec![chunk.clone()];
                     sections.insert(si, section);
                 }
             }
         }
+        let mut sections: BTreeMap<_, _> = sections.into_iter().map(|(si, section)| (si, FileChunkSection::new(si, section))).collect();
 
+        let mut mut_part = self.mut_part.write().unwrap();
+        std::mem::swap(&mut mut_part.sections, &mut sections);
+        mut_part.file_size = file_size;
         Ok(())
     }
 
-    pub fn read_at(&self, file_size: u64, buf: &mut [u8], offset: u64) -> std::io::Result<(usize, u64)> {
+    pub fn read_at(
+        &self, 
+        lookup: &impl LookupFileId, 
+        file_size: u64, 
+        buf: &mut [u8], 
+        offset: u64
+    ) -> std::io::Result<(usize, u64)> {
         if offset >= file_size {
             return Ok((0, 0));
         }
         let mut read = 0;
         let mut ts_ns = 0;
-        let sections = self.sections.read().unwrap();
+        let mut_part = self.mut_part.read().unwrap();
         let index_range = offset / SECTION_SIZE..(offset + buf.len() as u64) / SECTION_SIZE + 1;
         for si in index_range {
             let read_range = max(offset, si * SECTION_SIZE)..min(offset + buf.len() as u64, (si + 1) * SECTION_SIZE);
-            if let Some(section) = sections.get(&si) {
-                let (n, ns) = section.read_at(file_size, &mut buf[(read_range.start - offset) as usize..(read_range.end - offset) as usize], read_range.start)?;
+            if let Some(section) = mut_part.sections.get(&si) {
+                let (n, ns) = section.read_at(
+                    lookup, 
+                    mut_part.file_size, 
+                    &self.reader_cache, 
+                    &mut buf[(read_range.start - offset) as usize..(read_range.end - offset) as usize], 
+                    read_range.start as i64
+                )?;
                 read += n;
                 ts_ns = max(ts_ns, ns);
             } else {
