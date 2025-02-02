@@ -1,2 +1,4 @@
 pub mod filer_pb;
-pub mod filer_pb_ext;
+mod filer_pb_ext;
+
+pub use filer_pb_ext::*;

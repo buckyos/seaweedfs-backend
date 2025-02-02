@@ -25,23 +25,6 @@ pub fn total_size(chunks: &[FileChunk]) -> u64 {
     chunks.iter().map(|chunk| chunk.offset + chunk.size as i64).max().unwrap_or(0) as u64
 }
 
-pub fn file_size(entry: Option<&Entry>) -> u64 {
-    if entry.is_none() {
-        return 0;
-    }
-    let entry = entry.as_ref().unwrap();
-    if entry.attributes.is_none() {
-        return 0;
-    }
-    let attributes = entry.attributes.as_ref().unwrap();
-    let mut file_size = entry.attributes.as_ref().unwrap().file_size;
-    if let Some(remote_entry) = &entry.remote_entry {
-        if remote_entry.remote_mtime > attributes.mtime {
-            file_size = max(file_size, remote_entry.remote_size as u64);
-        }
-    }
-    max(total_size(entry.chunks.as_slice()), file_size)
-}
 
 pub fn has_chunk_manifest(chunks: &[FileChunk]) -> bool {
     chunks.iter().any(|chunk| chunk.is_chunk_manifest)

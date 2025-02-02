@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{PathBuf, Path};
 use md5::{Md5, Digest};
 
+pub const ROOT_INODE: u64 = 1;
+
 pub trait PathExt {
     fn as_inode(&self, ts_ns: u64) -> u64;
 }
@@ -17,7 +19,7 @@ impl PathExt for &Path {
 }
 
 struct InodeEntry {
-    path: PathBuf,
+    path: Vec<PathBuf>,
     nlookup: u64,
     is_directory: bool,
 }
@@ -30,12 +32,12 @@ pub struct InodeToPath {
 impl InodeToPath {
     pub fn new(root: PathBuf) -> Self {
         Self {
-            inode_to_path: BTreeMap::from([(1, InodeEntry { path: root.clone(), nlookup: 1, is_directory: true })]),
-            path_to_inode: HashMap::from([(root, 1)]),
+            inode_to_path: BTreeMap::from([(ROOT_INODE, InodeEntry { path: vec![root.clone()], nlookup: 1, is_directory: true })]),
+            path_to_inode: HashMap::from([(root, ROOT_INODE)]),
         }
     }
 
     pub fn get_path(&self, inode: u64) -> Option<&Path> {
-        self.inode_to_path.get(&inode).map(|entry| entry.path.as_path())
+        self.inode_to_path.get(&inode).and_then(|entry| entry.path.first().map(|p| p.as_path()))
     }
 }

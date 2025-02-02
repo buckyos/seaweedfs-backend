@@ -3,7 +3,7 @@ use std::cmp::max;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use dfs_common::pb::filer_pb::Entry;
+use dfs_common::pb::{*, filer_pb::{Entry, FuseAttributes}};
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::ChunkGroup;
 use dfs_common::ChunkCache;
@@ -19,7 +19,7 @@ struct EntryAndChunks<T: ChunkCache> {
 
 impl<T: ChunkCache> EntryAndChunks<T> {
     fn from_entry(lookup: &impl LookupFileId, chunk_cache: T, entry: Entry) -> Result<Self> {
-        let file_size = chunks::file_size(Some(&entry));
+        let file_size = entry.file_size();
         let mut entry = entry;
         entry.attributes.as_mut().unwrap().file_size = file_size;
         let chunk_group = ChunkGroup::new(chunk_cache);
@@ -39,7 +39,7 @@ impl<T: ChunkCache> EntryAndChunks<T> {
     ) -> std::io::Result<(usize, u64)> {
         let mut file_size = self.entry.attributes.as_ref().unwrap().file_size;
         if file_size == 0 {
-            file_size = chunks::file_size(Some(&self.entry));
+            file_size = self.entry.file_size();
         }
         if file_size == 0 {
             return Ok((0, 0));
@@ -63,8 +63,9 @@ impl<T: ChunkCache> EntryAndChunks<T> {
 }
 
 struct FileHandleMutPart<C: ChunkCache> {
-    entry: Option<EntryAndChunks<C>>,
+    entry: EntryAndChunks<C>,
     page_writer: PageWriter,
+    dirty: bool,
 }
 
 
@@ -106,10 +107,10 @@ impl<T: FileHandleOwner> FileHandle<T> {
         owner: T,
         handle_id: FileHandleId, 
         inode: u64, 
-        entry: Option<Entry>,
-    ) -> Self {
-        let entry_and_chunks = entry.and_then(|entry| EntryAndChunks::from_entry(&owner, owner.clone(), entry).ok());
-        Self {
+        entry: Entry,
+    ) -> Result<Self> {
+        let entry_and_chunks = EntryAndChunks::from_entry(&owner, owner.clone(), entry)?;
+        Ok(Self {
             inner: Arc::new(FileHandleInner {
                 fh: handle_id,
                 counter: 1,
@@ -117,14 +118,34 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 mut_part: RwLock::new(FileHandleMutPart {
                     entry: entry_and_chunks,
                     page_writer: PageWriter::new(owner.chunk_size_limit(), owner.concurrent_writers()),
+                    dirty: false,
                 }),
                 owner,
             }),
-        }
+        })
+    }
+
+    pub fn id(&self) -> FileHandleId {
+        self.inner.fh
     }
 
     fn owner(&self) -> &T {
         &self.inner.owner
+    }
+
+    pub fn entry(&self) -> Entry {
+        let mut_part = self.inner.mut_part.read().unwrap();
+        mut_part.entry.entry.clone()
+    }
+
+    pub fn update_entry(&self, entry: Entry, update_chunks: bool) -> Result<()> {
+        let mut mut_part = self.inner.mut_part.write().unwrap();
+        if update_chunks {
+            mut_part.entry.chunk_group.set_chunks(self.owner(), entry.attributes.as_ref().unwrap().file_size, entry.chunks.clone())?;
+        }
+        mut_part.entry.entry = entry;
+        mut_part.dirty = true;
+        Ok(())
     }
 
     pub fn full_path(&self) -> PathBuf {
@@ -137,11 +158,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
         offset: i64
     ) -> std::io::Result<(usize, u64)> {
         let mut_part = &self.inner.mut_part.read().unwrap();
-        let (read, ts_ns) = if let Some(entry_and_chunks) = &mut_part.entry {
-            entry_and_chunks.read_from_chunks(self.owner(), buff, offset)
-        } else {
-            Ok((0, 0))
-        }?;
+        let (read, ts_ns) = mut_part.entry.read_from_chunks(self.owner(), buff, offset)?;
         let max_stop = mut_part.page_writer.read(buff, offset, ts_ns);
         let read = max(read, (max_stop as i64 - offset) as usize);
         Ok((read as usize, ts_ns))
@@ -169,8 +186,8 @@ impl<T: FileHandleOwner> FileHandle<T> {
             } {
                 let mut mut_part = self.inner.mut_part.write().unwrap();
                 mut_part.page_writer.post_uploaded(chunk_index, ts_ns);
-                mut_part.entry.as_mut().unwrap().chunk_group.add_chunks(chunks.clone());
-                mut_part.entry.as_mut().unwrap().entry.chunks.append(&mut chunks);
+                mut_part.entry.chunk_group.add_chunks(chunks.clone());
+                mut_part.entry.entry.chunks.append(&mut chunks);
             }
         }
         Ok(())
@@ -188,7 +205,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 .unwrap()
                 .as_nanos() as u64;
             
-            let file_size = &mut mut_part.entry.as_mut().unwrap().entry.attributes.as_mut().unwrap().file_size;
+            let file_size = &mut mut_part.entry.entry.attributes.as_mut().unwrap().file_size;
             *file_size = max(*file_size, offset as u64 + data.len() as u64);
     
             mut_part.page_writer.write(offset, data, ts_ns)
