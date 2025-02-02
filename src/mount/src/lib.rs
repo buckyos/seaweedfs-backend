@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod file_handle;
+mod path;
 mod weedfs;
 
 use std::ffi::OsStr;

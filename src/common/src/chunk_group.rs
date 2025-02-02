@@ -71,7 +71,6 @@ struct FileChunkSection {
     chunks: Vec<FileChunk>,
     visibles: IntervalList<VisibleInterval>,
     chunk_views: IntervalList<ChunkView>, 
-    reader_pattern: ReaderPattern,
     mut_part: Mutex<SectionMutPart>,
 }
 
@@ -103,12 +102,15 @@ impl FileChunkSection {
             chunk_views,
             section_index,
             chunks: compacted,
-            reader_pattern: ReaderPattern::new(), 
             mut_part: Mutex::new(SectionMutPart {
                 reader_pattern: ReaderPattern::new(),
                 last_chunk_fid: None,
             }),
         }
+    }
+
+    fn add_chunk(&mut self, chunk: FileChunk) {
+        unimplemented!()
     }
 
     fn read_resolved_chunks(chunks: &[FileChunk], range: Range<i64>) -> IntervalList<VisibleInterval> {
@@ -324,6 +326,17 @@ impl<T: ChunkCache> ChunkGroup<T> {
                 file_size: 0,
             }),
             reader_cache: ReaderCache::new(chunk_cache),
+        }
+    }
+
+    pub fn add_chunks(
+        &self, 
+        chunks: Vec<FileChunk>
+    ) {
+        let mut mut_part = self.mut_part.write().unwrap();
+        for chunk in chunks {
+            let section_index = chunk.offset as u64 / SECTION_SIZE;
+            mut_part.sections.entry(section_index).or_insert(FileChunkSection::new(section_index, vec![])).add_chunk(chunk);
         }
     }
 

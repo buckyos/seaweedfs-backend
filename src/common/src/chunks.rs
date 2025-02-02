@@ -2,14 +2,19 @@ use anyhow::Result;
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::{io::Cursor, ops::Range};
-use std::io::Write;
+use std::io::{Read, Write};
 use prost::Message;
 use crate::pb::filer_pb::{Entry, FileChunk, FileChunkManifest};
-use ureq::{AgentBuilder};
+use ureq::AgentBuilder;
 use std::time::Duration;
+
 
 pub trait LookupFileId {
     fn lookup(&self, file_id: &str) -> Result<Vec<String>>;
+}
+
+pub trait UploadChunk {
+    fn upload(&self, content: impl Read, file_id: &str, offset: i64, ts_ns: u64) -> Result<FileChunk>;
 }
 
 thread_local! {
