@@ -164,7 +164,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
         Ok((read as usize, ts_ns))
     }
 
-    fn upload(&self, uploads: Vec<(i64, u64)>) -> Result<()> {
+    async fn upload(&self, uploads: Vec<(i64, u64)>) -> Result<()> {
         let full_path = self.full_path();
         let file_id = full_path.file_name().unwrap().to_str().unwrap();
         for (chunk_index, ts_ns) in uploads {
@@ -175,8 +175,8 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 } {
                     let mut chunks = Vec::new();
                     let readers = page.split_readers();
-                    for (reader, offset, ts_ns) in readers {
-                        let chunk = self.owner().upload(reader, file_id, offset, ts_ns)?;
+                    for reader in readers {
+                        let chunk = self.owner().upload(reader, full_path.to_str().unwrap(), file_id).await?;
                         chunks.push(chunk);
                     }
                     Some(chunks)

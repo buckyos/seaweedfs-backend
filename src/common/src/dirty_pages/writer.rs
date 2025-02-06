@@ -81,7 +81,7 @@ impl PageWriter {
                     None
                 }
             } else {
-                let mut page = MemPage::new(self.chunk_size);
+                let mut page = MemPage::new(chunk_index, self.chunk_size);
                 page.write(&remaining_data[..writen], offset, ts_ns);
                 self.writable_chunks.insert(chunk_index, page);
                 if self.writable_chunks.len() > self.writable_chunk_limit {

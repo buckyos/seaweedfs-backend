@@ -1,5 +1,7 @@
 use std::cmp::max;
+use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 use anyhow::Result;
 use tokio::time::sleep;
@@ -51,7 +53,7 @@ impl EntryExt for Entry {
     }
 }
 
-pub trait FileIdExt: ToString {
+pub trait FileIdExt: ToString + FromStr {
 }
 
 
@@ -69,6 +71,18 @@ impl ToString for FileId {
     }
 }
 
+impl FromStr for FileId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(2, ',');
+        let volume_id = parts.next().unwrap().parse::<u32>()?;
+        let file_key = parts.next().unwrap().parse::<u64>()?;
+        let cookie = parts.next().unwrap().parse::<u32>()?;
+        Ok(FileId { volume_id, file_key, cookie })
+    }
+}
+    
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
 }
@@ -118,6 +132,53 @@ impl FilerClient {
                 })
             })
         })
+    }
+
+    async fn async_with_retry<F, Fut, T>(&self, f: F) -> Result<T>
+    where 
+        F: Fn(SeaweedFilerClient<Channel>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut retries = 0;
+        let mut delay = Duration::from_millis(100);
+        let start_idx = self.last_success.load(Ordering::Relaxed);
+        
+        loop {
+            for i in 0..self.clients.len() {
+                let idx = (start_idx + i) % self.clients.len();
+                let client = self.clients[idx].clone();
+
+                match tokio::time::timeout(
+                    self.timeout,
+                    f(client)
+                ).await {
+                    Ok(Ok(resp)) => {
+                        self.last_success.store(idx, Ordering::Relaxed);
+                        return Ok(resp);
+                    }
+                    Ok(Err(e)) => {
+                        if i == self.clients.len() - 1 {
+                            if retries >= self.max_retries {
+                                return Err(anyhow::anyhow!("max retries reached: {}", e));
+                            }
+                            retries += 1;
+                            sleep(delay).await;
+                            delay *= 2;
+                        }
+                    }
+                    Err(_) => {
+                        if i == self.clients.len() - 1 {
+                            if retries >= self.max_retries {
+                                return Err(anyhow::anyhow!("timeout after {} retries", retries));
+                            }
+                            retries += 1;
+                            sleep(delay).await;
+                            delay *= 2;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn with_retry<F, Fut, T>(&self, f: F) -> Result<T>
@@ -175,13 +236,31 @@ impl FilerClient {
         })
     }
 
-    // 同步 API
-    pub fn lookup_volume(&self, req: LookupVolumeRequest) -> Result<LookupVolumeResponse> {
-        self.with_retry(|mut client| {
+    pub fn prefer_address_index(&self) -> usize {
+        self.last_success.load(Ordering::Relaxed)
+    }
+
+    
+    pub async fn async_assign_volume(&self, req: AssignVolumeRequest) -> Result<AssignVolumeResponse> {
+        self.async_with_retry(|mut client| {
             let req = req.clone();
             async move {
-                let response = client.lookup_volume(req.clone()).await?;
+                let response = client.assign_volume(req).await?;
                 Ok(response.into_inner())
+            }
+        }).await
+    }
+
+
+    // 同步 API
+    pub fn lookup_volume(&self, req: Vec<String>) -> Result<HashMap<String, Locations>> {
+        self.with_retry(|mut client| {
+            let req = LookupVolumeRequest {
+                volume_ids: req.clone(),
+            };
+            async move {
+                let response = client.lookup_volume(req).await?;
+                Ok(response.into_inner().locations_map)
             }
         })
     }

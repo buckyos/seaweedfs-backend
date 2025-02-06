@@ -5,6 +5,12 @@ pub trait IntervalValue: Clone {
     fn set_range(&mut self, old_range: Range<i64>, new_range: Range<i64>);
 }
 
+impl IntervalValue for () {
+    fn set_range(&mut self, _old_range: Range<i64>, _new_range: Range<i64>) {
+        // do nothing
+    }
+}
+
 #[derive(Clone)]
 pub struct Interval<T: IntervalValue> {
     pub range: Range<i64>,

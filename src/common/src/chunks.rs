@@ -1,20 +1,27 @@
 use anyhow::Result;
+use serde::Deserialize;
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::{io::Cursor, ops::Range};
 use std::io::{Read, Write};
 use prost::Message;
 use crate::pb::filer_pb::{Entry, FileChunk, FileChunkManifest};
+use crate::dirty_pages::{SplitChunkPage, SplitPageContent};
 use ureq::AgentBuilder;
 use std::time::Duration;
-
 
 pub trait LookupFileId {
     fn lookup(&self, file_id: &str) -> Result<Vec<String>>;
 }
 
+#[async_trait::async_trait]
 pub trait UploadChunk {
-    fn upload(&self, content: impl Read, file_id: &str, offset: i64, ts_ns: u64) -> Result<FileChunk>;
+    async fn upload<'a>(
+        &self, 
+        content: SplitChunkPage<'a>, 
+        full_path: &str, 
+        file_id: &str
+    ) -> Result<FileChunk>;
 }
 
 thread_local! {
@@ -168,3 +175,74 @@ pub fn retried_fetch_chunk_data(
 }
 
 
+#[derive(Debug, Deserialize)]
+pub struct UploadResult {
+    pub name: Option<String>,
+    pub size: Option<u32>,
+    pub error: Option<String>,
+    #[serde(rename = "eTag")]
+    pub etag: Option<String>,
+    #[serde(rename = "cipherKey")]
+    pub cipher_key: Option<Vec<u8>>,
+    pub mime: Option<String>,
+    pub gzip: Option<u32>,
+    #[serde(rename = "contentMd5")]
+    pub content_md5: Option<String>,
+}
+
+pub async fn async_retried_upload_chunk<'a>(
+    content: &SplitChunkPage<'a>,
+    target_url: &str, 
+    file_id: &str,
+) -> Result<UploadResult> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let mut wait_time = Duration::from_secs(1);
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    let mut last_err = None;
+
+    while wait_time < MAX_WAIT {
+        let body = match &content.content {
+            SplitPageContent::Mem(content) => {
+                let content = unsafe {
+                    std::mem::transmute::<&[u8], &[u8]>(*content)
+                };
+                reqwest::Body::from(content)
+            }
+            SplitPageContent::File(content) => {
+                unimplemented!()
+            }
+        };
+        match client.post(target_url)
+            .header("Content-Disposition", format!("form-data; name=\"file\"; filename=\"{}\"", file_id))
+            .header("Idempotency-Key", target_url)
+            .body(body)
+            .send()
+            .await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !(200..300).contains(&status.as_u16()) {
+                        if status.as_u16() >= 500 {
+                            wait_time *= 2;
+                            std::thread::sleep(wait_time);
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("{}: {}", target_url, status));
+                    }
+                    let body = resp.bytes().await?;
+                    let upload_result: UploadResult = serde_json::from_slice(&body)?;
+                    return Ok(upload_result);
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    wait_time *= 2;
+                    std::thread::sleep(wait_time);
+                    continue;
+                }
+        }
+    }
+
+    Err(anyhow::anyhow!("failed after retries: {:?}", last_err))
+}

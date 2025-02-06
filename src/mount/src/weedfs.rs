@@ -1,19 +1,26 @@
 use anyhow::{Result, Error};
-use dfs_common::pb::{*, filer_pb::{Entry, FileChunk, FuseAttributes}};
-use std::collections::{BTreeMap, HashMap};
-use std::io::Read;
+use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes, Locations}, *}, SplitChunkPage};
+use std::{collections::{BTreeMap, HashMap}, str::FromStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::ffi::OsStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
 };
 use libc::ENOENT;
+use dfs_common::pb::filer_pb::AssignVolumeRequest;
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
 use crate::file_handle::{FileHandle, FileHandleId, FileHandleOwner};
 use crate::path::{InodeToPath, ROOT_INODE};
+use rand::seq::SliceRandom;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolumeServerAccess {
+    FilerProxy,
+    PublicUrl,
+    Url,
+}
 
 pub struct WfsOption {
     pub filer_addresses: Vec<String>,
@@ -26,6 +33,14 @@ pub struct WfsOption {
     pub mount_mode: u32,
     pub mount_uid: u32,
     pub mount_gid: u32,
+
+    pub replication: String,
+    pub collection: String,
+    pub ttl: Duration,
+    pub disk_type: String,
+    pub data_center: String,
+
+    pub volume_server_access: VolumeServerAccess,
 }
 
 struct FileHandleInodeMap {
@@ -39,7 +54,8 @@ struct WfsInner {
     filer_client: FilerClient,
     inode_to_path: RwLock<InodeToPath>,
     fh_map: RwLock<FileHandleInodeMap>, 
-    chunk_cache: ChunkCacheInMem
+    chunk_cache: ChunkCacheInMem, 
+    volume_location_cache: RwLock<HashMap<String, (Vec<String>, Vec<String>)>>,
 }
 
 pub struct Wfs {
@@ -70,7 +86,8 @@ impl Wfs {
                     inode_to_fh: BTreeMap::new(),
                     fh_to_inode: BTreeMap::new(),
                 }),
-                chunk_cache: ChunkCacheInMem::new(1024),
+                chunk_cache: ChunkCacheInMem::new(1024), 
+                volume_location_cache: RwLock::new(HashMap::new()),
                 option,
             }),
         })
@@ -147,13 +164,118 @@ impl Wfs {
 
 impl LookupFileId for Wfs {
     fn lookup(&self, file_id: &str) -> Result<Vec<String>> {
-        unimplemented!()
+        let pulic_url = match self.option().volume_server_access {
+            VolumeServerAccess::FilerProxy => {
+                return Ok(vec![format!("http://{}/?proxyChunkId={}", self.option().filer_addresses[self.filer_client().prefer_address_index()], file_id)]);
+            }, 
+            VolumeServerAccess::PublicUrl => {
+                true
+            }, 
+            VolumeServerAccess::Url => {
+                false
+            },
+        };
+        
+        let file_id = FileId::from_str(file_id)?;
+        let vid = file_id.volume_id.to_string();
+        let cached_locations = {
+            let vid_cache = self.inner.volume_location_cache.read().unwrap();
+            if let Some(locations) = vid_cache.get(&vid) {
+                Some(locations.clone())
+            } else {
+                None
+            }
+        };
+
+        let (mut same_dc_locations, mut other_locations) = if let Some(locations) = cached_locations {
+            locations
+        } else {
+            let mut locations = self.filer_client().lookup_volume(vec![vid.clone()])?;
+            if locations.is_empty() {
+                return Err(anyhow::anyhow!("no locations found for volume {}", vid));
+            }
+            let locations = locations.remove(&vid).unwrap();
+            let mut same_dc_locations = Vec::new();
+            let mut other_locations = Vec::new();
+            for location in locations.locations {
+                if location.data_center == self.option().data_center {
+                    if pulic_url {
+                        same_dc_locations.push(location.public_url);
+                    } else {
+                        same_dc_locations.push(location.url);
+                    }
+                } else {
+                    if pulic_url {
+                        other_locations.push(location.public_url);
+                    } else {
+                        other_locations.push(location.url);
+                    }
+                }
+            }
+            self.inner.volume_location_cache.write().unwrap().insert(vid, (same_dc_locations.clone(), other_locations.clone()));
+            (same_dc_locations, other_locations)
+        };
+       
+        
+        same_dc_locations.shuffle(&mut rand::rng());
+        other_locations.shuffle(&mut rand::rng());
+        same_dc_locations.append(&mut other_locations);
+        Ok(same_dc_locations)
     }
 }
 
+#[async_trait::async_trait]
 impl UploadChunk for Wfs {
-    fn upload(&self, content: impl Read, file_id: &str, offset: i64, ts_ns: u64) -> Result<FileChunk> {
-        unimplemented!()
+    async fn upload<'a>(
+        &self,
+        content: SplitChunkPage<'a>,
+        full_path: &str,
+        file_id: &str
+    ) -> Result<FileChunk> {
+        let assign_volume_req = AssignVolumeRequest {
+            count: 1,
+            replication: self.option().replication.clone(),
+            collection: self.option().collection.clone(),
+            ttl_sec: self.option().ttl.as_secs() as i32,
+            disk_type: self.option().disk_type.clone(),
+            data_center: self.option().data_center.clone(),
+            rack: "".to_string(),
+            data_node: "".to_string(),
+            path: full_path.to_string(),
+        };
+        let assign_volume_resp = self.filer_client().async_assign_volume(assign_volume_req).await?;
+        let location = assign_volume_resp.location.ok_or_else(|| anyhow::anyhow!("no location found for volume {}", file_id))?;
+        let upload_url = match self.option().volume_server_access {
+            VolumeServerAccess::FilerProxy => {
+                format!("http://{}/?proxyChunkId={}", location.url, file_id)
+            },
+            VolumeServerAccess::PublicUrl => {
+                format!("http://{}/{}", location.public_url, file_id)
+            },
+            VolumeServerAccess::Url => {
+                format!("http://{}/{}", location.url, file_id)
+            },
+        };
+
+        // FIXME: auth, gzip and cipher
+        let result = chunks::async_retried_upload_chunk(&content, &upload_url, file_id).await?;
+        // if content.offset == 0 {
+        //     self.chunk_cache().set(&assign_volume_resp.file_id, Arc::new());
+        // }
+        Ok(FileChunk {
+            offset: content.offset,
+            size: result.size.unwrap() as u64,
+            modified_ts_ns: content.ts_ns as i64,
+            e_tag: result.content_md5.unwrap_or_default(),
+            source_file_id: "".to_string(),
+            fid: FileId::from_str(&assign_volume_resp.file_id).ok(),
+            source_fid: None,
+            cipher_key: result.cipher_key.unwrap_or_default(),
+            is_compressed: result.gzip.unwrap_or(0) > 0,
+            is_chunk_manifest: false,
+            file_id: assign_volume_resp.file_id,
+        })
+
     }
 }
 

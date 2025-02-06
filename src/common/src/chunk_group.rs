@@ -4,7 +4,6 @@ use std::ops::Range;
 use std::sync::{Mutex, RwLock};
 use anyhow::Result;
 use crate::pb::filer_pb::FileChunk;
-// use crate::pb::filer_pb_ext::FileIdExt;
 use crate::chunks::{self, LookupFileId};
 use crate::interval_list::{IntervalList, IntervalValue, Interval};
 use crate::reader_cache::{ReaderCache, ChunkView};
@@ -110,7 +109,42 @@ impl FileChunkSection {
     }
 
     fn add_chunk(&mut self, chunk: FileChunk) {
-        unimplemented!()
+        let range = max(chunk.offset, (self.section_index * SECTION_SIZE) as i64)..min(chunk.offset + chunk.size as i64, ((self.section_index + 1) * SECTION_SIZE) as i64);
+        self.visibles.insert(
+            Interval {
+                ts_ns: chunk.modified_ts_ns,
+                range: range.clone(),
+                value: VisibleInterval {
+                    file_id: chunk.file_id.to_string(),
+                    offset_in_chunk: range.start - chunk.offset,
+                    chunk_size: chunk.size,
+                },
+            }
+        );
+
+        let garbage_file_ids = self.visibles.iter().filter(|visible| {
+            let offset = visible.range.start - visible.value.offset_in_chunk;
+            offset >= range.start && offset + visible.value.chunk_size as i64 <= range.end
+        }).map(|visible| &visible.value.file_id).collect::<HashSet<_>>();
+
+        self.chunks.retain(|chunk| !garbage_file_ids.contains(&chunk.file_id));
+
+        self.chunk_views.insert(
+            Interval {
+                ts_ns: chunk.modified_ts_ns,
+                range: range.clone(),
+                value: ChunkView {
+                    file_id: chunk.file_id.to_string(),
+                    offset_in_chunk: range.start - chunk.offset,
+                    chunk_size: chunk.size,
+                    view_size: (range.end - range.start) as u64,
+                    view_offset: range.start,
+                },
+            }
+        );
+
+
+        self.chunks.push(chunk);
     }
 
     fn read_resolved_chunks(chunks: &[FileChunk], range: Range<i64>) -> IntervalList<VisibleInterval> {
