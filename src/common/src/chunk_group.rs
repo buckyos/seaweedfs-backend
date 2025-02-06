@@ -159,7 +159,7 @@ impl FileChunkSection {
         // 收集所有点
         let mut points = Vec::new();
         for chunk in chunks {
-            let range = max(chunk.offset, range.start)..min(chunk.offset + chunk.size as i64, range.end);
+            // let range = max(chunk.offset, range.start)..min(chunk.offset + chunk.size as i64, range.end);
             points.push(Point {
                 x: chunk.offset,
                 ts: chunk.modified_ts_ns,
@@ -388,7 +388,7 @@ impl<T: ChunkCache> ChunkGroup<T> {
                 continue;
             }
 
-            let mut resolved_chunks = chunks::resolve_chunk_manifest(lookup.clone(), &chunk)?;
+            let mut resolved_chunks = chunks::resolve_chunk_manifest(lookup, &chunk)?;
             data_chunks.append(&mut resolved_chunks);
         }   
         for chunk in data_chunks {

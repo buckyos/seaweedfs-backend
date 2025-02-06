@@ -3,9 +3,9 @@ use serde::Deserialize;
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::{io::Cursor, ops::Range};
-use std::io::{Read, Write};
+use std::io::Write;
 use prost::Message;
-use crate::pb::filer_pb::{Entry, FileChunk, FileChunkManifest};
+use crate::pb::filer_pb::{FileChunk, FileChunkManifest};
 use crate::dirty_pages::{SplitChunkPage, SplitPageContent};
 use ureq::AgentBuilder;
 use std::time::Duration;
@@ -113,12 +113,12 @@ pub fn resolve_chunks_manifest(
         }
 
         let resolved_chunks = resolve_chunk_manifest(
-            lookup.clone(), 
+            lookup, 
             &chunk)?;
         
         manifest_chunks.push(chunk);
         // recursive
-        let (mut sub_data_chunks, mut sub_manifest_chunks) = resolve_chunks_manifest(lookup.clone(), resolved_chunks, offset_range.clone())?;
+        let (mut sub_data_chunks, mut sub_manifest_chunks) = resolve_chunks_manifest(lookup, resolved_chunks, offset_range.clone())?;
         data_chunks.append(&mut sub_data_chunks);
         manifest_chunks.append(&mut sub_manifest_chunks);
     }
@@ -211,7 +211,7 @@ pub async fn async_retried_upload_chunk<'a>(
                 };
                 reqwest::Body::from(content)
             }
-            SplitPageContent::File(content) => {
+            SplitPageContent::File(_content) => {
                 unimplemented!()
             }
         };

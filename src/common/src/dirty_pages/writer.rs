@@ -1,7 +1,6 @@
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use super::page::{ChunkPage, WritableChunkPage, SealedChunkPage};
+use super::page::{ChunkPage, WritableChunkPage};
 use super::mem::{MemPage, SealedMemPage};
 
 pub struct PageWriter {

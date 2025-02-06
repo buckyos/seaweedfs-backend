@@ -1,11 +1,11 @@
-use anyhow::{Result, Error};
-use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes, Locations}, *}, SplitChunkPage};
+use anyhow::Result;
+use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *}, SplitChunkPage};
 use std::{collections::{BTreeMap, HashMap}, str::FromStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
+    FileAttr, Filesystem, ReplyAttr, ReplyData, ReplyEmpty, ReplyOpen, ReplyWrite, Request, TimeOrNow
 };
 use libc::ENOENT;
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
@@ -16,7 +16,7 @@ use crate::path::{InodeToPath, ROOT_INODE};
 use rand::seq::SliceRandom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VolumeServerAccess {
+pub enum VolumeServerAccess {
     FilerProxy,
     PublicUrl,
     Url,
@@ -424,8 +424,8 @@ impl Filesystem for Wfs {
                 // 只返回实际读取的数据
                 reply.data(&buffer[..n]);
             },
-            Err(e) => {
-                reply.error(ENOENT);  // 或其他适当的错误码
+            Err(_) => {
+                reply.error(ENOENT);
             }
         }
     }
@@ -525,7 +525,7 @@ impl Filesystem for Wfs {
             if let Some(fh) = fh {
                 match fh.update_entry(entry.clone(), update_chunks) {
                     Ok(_) => (),
-                    Err(e) => {
+                    Err(_) => {
                         reply.error(ENOENT);
                         return;
                     }
@@ -534,7 +534,7 @@ impl Filesystem for Wfs {
 
             match self.filer_client().update_entry(entry.clone()) {
                 Ok(_) => (),
-                Err(e) => {
+                Err(_) => {
                     reply.error(ENOENT);
                     return;
                 }

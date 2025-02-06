@@ -1,4 +1,4 @@
-use std::{cmp::{max, min}, io::{Cursor, Read}, sync::Arc};
+use std::{cmp::{max, min}, sync::Arc};
 use super::page::*;
 use crate::interval_list::{Interval, IntervalList};
 
@@ -31,7 +31,7 @@ impl WritableChunkPage for MemPage {
 }
 
 impl ChunkPage for MemPage {
-    fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> u64 {
+    fn read(&self, data: &mut [u8], offset: i64, _ts_ns: u64) -> u64 {
         let mut max_stop = 0;
         let chunk_offset = self.chunk_index * self.data.len() as i64;
         for interval in self.usage.iter() {
