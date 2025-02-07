@@ -147,7 +147,7 @@ impl FileChunkSection {
         self.chunks.push(chunk);
     }
 
-    fn read_resolved_chunks(chunks: &[FileChunk], range: Range<i64>) -> IntervalList<VisibleInterval> {
+    fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> IntervalList<VisibleInterval> {
         #[derive(Clone)]
         struct Point<'a> {
             x: i64,

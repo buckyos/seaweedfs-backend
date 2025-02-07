@@ -252,6 +252,21 @@ impl FilerClient {
     }
 
 
+    pub fn create_entry(&self, parent_dir: &Path, entry: &Entry) -> Result<()> {
+        self.with_retry(|mut client| {
+            let req = CreateEntryRequest {
+                directory: parent_dir.to_string_lossy().to_string(),
+                entry: Some(entry.clone()),
+                skip_check_parent_directory: true, 
+                ..Default::default()
+            };
+            async move {
+                let _ = client.create_entry(req).await?;
+                Ok(())
+            }
+        })
+    }
+
     // 同步 API
     pub fn lookup_volume(&self, req: Vec<String>) -> Result<HashMap<String, Locations>> {
         self.with_retry(|mut client| {
