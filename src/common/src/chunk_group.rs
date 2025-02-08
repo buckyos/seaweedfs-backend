@@ -1,29 +1,14 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashSet};
-use std::ops::Range;
 use std::sync::{Mutex, RwLock};
 use anyhow::Result;
 use crate::pb::filer_pb::FileChunk;
-use crate::chunks::{self, LookupFileId};
-use crate::interval_list::{IntervalList, IntervalValue, Interval};
+use crate::chunks::{self, LookupFileId, VisibleInterval};
+use crate::interval_list::{IntervalList, Interval};
 use crate::reader_cache::{ReaderCache, ChunkView};
 use crate::chunk_cache::ChunkCache;
 pub type SectionIndex = u64;
 const SECTION_SIZE: u64 = 2 * 1024 * 1024 * 32; // 64MiB
-
-#[derive(Clone)]
-struct VisibleInterval {
-    file_id: String,
-    offset_in_chunk: i64,
-    chunk_size: u64,
-}
-
-impl IntervalValue for VisibleInterval {
-    fn set_range(&mut self, old_range: Range<i64>, new_range: Range<i64>) {
-        self.offset_in_chunk += new_range.start - old_range.start;
-    }
-}
-
 
 struct ReaderPattern {
     is_sequential_counter: i64,
@@ -75,7 +60,7 @@ struct FileChunkSection {
 
 impl FileChunkSection {
     fn new(section_index: SectionIndex, chunks: Vec<FileChunk>) -> Self {
-        let visibles = Self::read_resolved_chunks(&chunks, (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64);
+        let visibles = chunks::read_resolved_chunks(&chunks, (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64);
         let visables = visibles.iter().map(|visable| &visable.value.file_id).collect::<HashSet<_>>();
         let (compacted, _) = chunks.into_iter().partition(|chunk| visables.contains(&chunk.file_id));
         let chunk_views = visibles.iter().filter_map(|visable| {
@@ -147,103 +132,7 @@ impl FileChunkSection {
         self.chunks.push(chunk);
     }
 
-    fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> IntervalList<VisibleInterval> {
-        #[derive(Clone)]
-        struct Point<'a> {
-            x: i64,
-            ts: i64,
-            chunk: &'a FileChunk,
-            is_start: bool,
-        }
-
-        // 收集所有点
-        let mut points = Vec::new();
-        for chunk in chunks {
-            // let range = max(chunk.offset, range.start)..min(chunk.offset + chunk.size as i64, range.end);
-            points.push(Point {
-                x: chunk.offset,
-                ts: chunk.modified_ts_ns,
-                chunk,
-                is_start: true,
-            });
-            points.push(Point {
-                x: chunk.offset + chunk.size as i64,
-                ts: chunk.modified_ts_ns,
-                chunk,
-                is_start: false,
-            });
-        }
-
-        // 排序点
-        points.sort_by(|a, b| {
-            if a.x != b.x {
-                return a.x.cmp(&b.x);
-            }
-            if a.ts != b.ts {
-                return a.ts.cmp(&b.ts);
-            }
-            if a.is_start {
-                return std::cmp::Ordering::Greater;
-            }
-            std::cmp::Ordering::Less
-        });
-
-        let mut queue: Vec<Point> = Vec::new();
-        let mut prev_x = 0;
-        let mut visible_intervals = IntervalList::new();
-
-        for point in &points {
-            if point.is_start {
-                if let Some(prev_point) = queue.last() {
-                    if point.x != prev_x && prev_point.ts < point.ts {
-                        let chunk = prev_point.chunk;
-                        visible_intervals.push_back(Interval {
-                            range: prev_x..point.x,
-                            ts_ns: chunk.modified_ts_ns,
-                            value: VisibleInterval {
-                                file_id: chunk.file_id.to_string(),
-                                offset_in_chunk: prev_x - chunk.offset,
-                                chunk_size: chunk.size,
-                            },
-                        });
-                        prev_x = point.x;
-                        continue;
-                    } else if prev_point.ts < point.ts {
-                        queue.push(point.clone());
-                        prev_x = point.x;
-                        continue;
-                    }
-                }
-
-                // 找到合适的插入位置
-                let pos = queue.binary_search_by(|p| p.ts.cmp(&point.ts))
-                    .unwrap_or_else(|e| e);
-                queue.insert(pos, point.clone());
-            } else {
-                // 找到并移除对应的点
-                if let Some(pos) = queue.iter().position(|p| p.ts == point.ts) {
-                    queue.remove(pos);
-                    if pos == queue.len() {
-                        if let Some(prev_point) = queue.last() {
-                            let chunk = prev_point.chunk;
-                            visible_intervals.push_back(Interval {
-                                range: prev_x..point.x,
-                                ts_ns: chunk.modified_ts_ns,
-                                value: VisibleInterval {
-                                    file_id: chunk.file_id.to_string(),
-                                    offset_in_chunk: prev_x - chunk.offset,
-                                    chunk_size: chunk.size,
-                                },
-                            });
-                            prev_x = point.x;
-                        }
-                    }
-                }
-            }
-        }
-
-        visible_intervals
-    }
+    
 
     fn read_chunk_slice_at<'a, T: ChunkCache>(
         &self, 

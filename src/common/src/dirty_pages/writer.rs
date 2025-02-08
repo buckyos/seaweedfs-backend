@@ -1,5 +1,7 @@
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
+use tokio::sync::oneshot;
+
 use super::page::{ChunkPage, WritableChunkPage};
 use super::mem::{MemPage, SealedMemPage};
 
@@ -11,6 +13,7 @@ pub struct PageWriter {
     last_write_stop_offset: i64,
     writable_chunks: BTreeMap<i64, MemPage>,
     sealed_chunks: BTreeMap<i64, SealedMemPage>,
+    flush_waiters: Vec<oneshot::Sender<()>>,
 }
 
 const MODE_CHANGE_LIMIT: i64 = 3;
@@ -24,6 +27,7 @@ impl PageWriter {
             last_write_stop_offset: 0,
             writable_chunks: BTreeMap::new(),
             sealed_chunks: BTreeMap::new(),
+            flush_waiters: vec![],
         }
     }
 
@@ -57,6 +61,11 @@ impl PageWriter {
         if let Some(page) = self.sealed_chunks.get(&chunk_index) {
             if page.latest_ts_ns() == ts_ns {
                 self.sealed_chunks.remove(&chunk_index);
+            }
+        }
+        if self.sealed_chunks.len() == 0 && self.writable_chunks.len() == 0 {
+            for sender in self.flush_waiters.drain(..) {
+                sender.send(()).unwrap();
             }
         }
     }
@@ -127,5 +136,31 @@ impl PageWriter {
             chunk_index += 1;
         }
         max_stop
+    }
+
+    pub fn flush(&mut self) -> (Option<Vec<(i64, u64)>>, Option<oneshot::Receiver<()>>) {
+        let mut to_upload = BTreeMap::new();
+        let mut uploads = vec![];
+        std::mem::swap(&mut self.writable_chunks, &mut to_upload);
+        for (chunk_index, page) in to_upload {
+            uploads.push((chunk_index, page.latest_ts_ns()));
+            self.sealed_chunks.insert(chunk_index, SealedMemPage::from(page));
+        }
+        let receiver = self.wait_all_uploaded();
+        if uploads.len() > 0 {
+            (Some(uploads), receiver)
+        } else {
+            (None, receiver)
+        }
+    }
+
+    fn wait_all_uploaded(&mut self) -> Option<oneshot::Receiver<()>> {
+        if self.sealed_chunks.len() > 0 || self.writable_chunks.len() > 0 {
+            let (sender, receiver) = oneshot::channel();
+            self.flush_waiters.push(sender);
+            Some(receiver)
+        } else {
+            None
+        }
     }
 }

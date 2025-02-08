@@ -21,6 +21,22 @@ pub struct SplitChunkPage<'a> {
     pub content: SplitPageContent<'a>,
 }
 
+impl<'a> Into<reqwest::Body> for &SplitPageContent<'a> {
+    fn into(self) -> reqwest::Body {
+        match self {
+            SplitPageContent::Mem(content) => {
+                let content = unsafe {
+                    std::mem::transmute::<&[u8], &[u8]>(*content)
+                };
+                reqwest::Body::from(content)
+            }
+            SplitPageContent::File(_content) => {
+                unimplemented!()
+            }
+        }
+    }
+}
 pub trait SealedChunkPage: ChunkPage + Sync {
     fn split_readers(&self) -> impl Iterator<Item = SplitChunkPage>;
 }
+

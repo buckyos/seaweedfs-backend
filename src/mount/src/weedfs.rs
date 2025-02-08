@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *}, SplitChunkPage};
+use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *}};
 use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, str::FromStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -11,9 +11,17 @@ use libc::{ENOENT, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
-use crate::file_handle::{FileHandle, FileHandleId, FileHandleOwner};
+use crate::file::{FileHandle, FileHandleId, FileHandleOwner};
 use crate::path::{InodeToPath, ROOT_INODE};
 use rand::seq::SliceRandom;
+use std::thread_local;
+use std::cell::RefCell;
+use tokio::runtime::Runtime;
+
+thread_local! {
+    static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeServerAccess {
@@ -75,8 +83,8 @@ const BLOCK_SIZE: u32 = 512;
 
 
 impl Wfs {
-    pub fn new(option: WfsOption) -> Result<Self> {
-        let filer_client = FilerClient::connect(option.filer_addresses.clone())?;
+    pub async fn new(option: WfsOption) -> Result<Self> {
+        let filer_client = FilerClient::connect(option.filer_addresses.clone()).await?;
         Ok(Self {
             inner: Arc::new(WfsInner {
                 filer_client,
@@ -115,7 +123,7 @@ impl Wfs {
         fh_map.inode_to_fh.get(&inode).cloned()
     }
 
-    fn get_entry_by_inode(&self, inode: u64) -> Option<(Entry, Option<FileHandle<Self>>)> {
+    async fn get_entry_by_inode(&self, inode: u64) -> Option<(Entry, Option<FileHandle<Self>>)> {
         if inode == ROOT_INODE {
             return Some((Entry {
                 name: "".to_string(),
@@ -135,14 +143,14 @@ impl Wfs {
             Some((fh.entry(), Some(fh)))
         } else {
             if let Some(path) = self.get_path(inode) {
-                self.get_entry_by_path(path.as_path()).map(|entry| (entry, None))
+                self.get_entry_by_path(path.as_path()).await.map(|entry| (entry, None))
             } else {
                 None
             }
         }
     }
 
-    fn get_entry_by_path(&self, path: &Path) -> Option<Entry> {
+    async fn get_entry_by_path(&self, path: &Path) -> Option<Entry> {
         if path == self.option().filer_mount_root_path {
             return Some(Entry {
                name: "".to_string(),
@@ -158,12 +166,10 @@ impl Wfs {
                ..Default::default()
             });
         } 
-        self.filer_client().lookup_directory_entry(path).ok().and_then(|entry| entry)
+        self.filer_client().lookup_directory_entry(path).await.ok().and_then(|entry| entry)
     }
-}
 
-impl LookupFileId for Wfs {
-    fn lookup(&self, file_id: &str) -> Result<Vec<String>> {
+    async fn lookup_volume(&self, file_id: &str) -> Result<Vec<String>> {
         let pulic_url = match self.option().volume_server_access {
             VolumeServerAccess::FilerProxy => {
                 return Ok(vec![format!("http://{}/?proxyChunkId={}", self.option().filer_addresses[self.filer_client().prefer_address_index()], file_id)]);
@@ -190,7 +196,7 @@ impl LookupFileId for Wfs {
         let (mut same_dc_locations, mut other_locations) = if let Some(locations) = cached_locations {
             locations
         } else {
-            let mut locations = self.filer_client().lookup_volume(vec![vid.clone()])?;
+            let mut locations = self.filer_client().lookup_volume(vec![vid.clone()]).await?;
             if locations.is_empty() {
                 return Err(anyhow::anyhow!("no locations found for volume {}", vid));
             }
@@ -224,14 +230,30 @@ impl LookupFileId for Wfs {
     }
 }
 
+impl LookupFileId for Wfs {
+    fn lookup(&self, file_id: &str) -> Result<Vec<String>> {
+        RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+            }
+            let rt_ref = rt.borrow();
+            let runtime = rt_ref.as_ref().unwrap();
+
+            runtime.block_on(self.lookup_volume(file_id))
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl UploadChunk for Wfs {
-    async fn upload<'a>(
+    async fn upload(
         &self,
-        content: SplitChunkPage<'a>,
-        full_path: &str,
-        file_id: &str
+        full_path: &Path,
+        content: impl Send + Clone + Into<reqwest::Body>, 
+        offset: i64,
+        ts_ns: i64
     ) -> Result<FileChunk> {
+        let file_id = full_path.file_name().unwrap().to_string_lossy().to_string();
         let assign_volume_req = AssignVolumeRequest {
             count: 1,
             replication: self.option().replication.clone(),
@@ -241,9 +263,9 @@ impl UploadChunk for Wfs {
             data_center: self.option().data_center.clone(),
             rack: "".to_string(),
             data_node: "".to_string(),
-            path: full_path.to_string(),
+            path: full_path.to_string_lossy().to_string(),
         };
-        let assign_volume_resp = self.filer_client().async_assign_volume(assign_volume_req).await?;
+        let assign_volume_resp = self.filer_client().assign_volume(assign_volume_req).await?;
         let location = assign_volume_resp.location.ok_or_else(|| anyhow::anyhow!("no location found for volume {}", file_id))?;
         let upload_url = match self.option().volume_server_access {
             VolumeServerAccess::FilerProxy => {
@@ -258,14 +280,15 @@ impl UploadChunk for Wfs {
         };
 
         // FIXME: auth, gzip and cipher
-        let result = chunks::async_retried_upload_chunk(&content, &upload_url, file_id).await?;
+        let result = chunks::retried_upload_chunk(&upload_url, &file_id, content).await?;
+        // TODO: insert to chunk cache
         // if content.offset == 0 {
         //     self.chunk_cache().set(&assign_volume_resp.file_id, Arc::new());
         // }
         Ok(FileChunk {
-            offset: content.offset,
+            offset: offset,
             size: result.size.unwrap() as u64,
-            modified_ts_ns: content.ts_ns as i64,
+            modified_ts_ns: ts_ns,
             e_tag: result.content_md5.unwrap_or_default(),
             source_file_id: "".to_string(),
             fid: FileId::from_str(&assign_volume_resp.file_id).ok(),
@@ -275,7 +298,6 @@ impl UploadChunk for Wfs {
             is_chunk_manifest: false,
             file_id: assign_volume_resp.file_id,
         })
-
     }
 }
 
@@ -305,6 +327,10 @@ impl FileHandleOwner for Wfs {
 
     fn get_path(&self, inode: u64) -> Option<PathBuf> {
         self.inner.inode_to_path.read().unwrap().get_path(inode).map(|p| p.to_path_buf())
+    }
+
+    fn filer_client(&self) -> &FilerClient {
+        &self.inner.filer_client
     }
 }
 
@@ -453,13 +479,26 @@ impl Filesystem for Wfs {
             }),
             ..Default::default()
         };
-        match self.filer_client().create_entry(entry_full_path.as_path(), &entry) {
+
+
+        
+
+        match RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+            }
+            let rt_ref = rt.borrow();
+            let runtime = rt_ref.as_ref().unwrap();
+
+            runtime.block_on(self.filer_client().create_entry(entry_full_path.as_path(), &entry))
+        }) {
             Ok(_) => (),
             Err(_) => {
                 reply.error(ENOENT);
                 return;
             }
         }
+
         let inode = self.inner.inode_to_path.write().unwrap().lookup(
             entry_full_path.as_path(), 
             now, 
@@ -482,22 +521,33 @@ impl Filesystem for Wfs {
         flags: i32,
         reply: ReplyOpen,
     ) {
-        if let Some((entry, _)) = self.get_entry_by_inode(ino) {
-            let mut fh_map = self.inner.fh_map.write().unwrap();
-            let id = if let Some(id) = fh_map.inode_to_fh.get(&ino).map(|fh| fh.id()) {
-                *fh_map.ref_count.get_mut(&id).unwrap() += 1;
-                id
-            } else {
-                let id = rand::random::<u64>();
-                let fh = FileHandle::new(self.clone(), id, ino, entry).unwrap();
-                fh_map.fh_to_inode.insert(fh.id(), ino);
-                fh_map.ref_count.insert(fh.id(), 1);
-                fh_map.inode_to_fh.insert(ino, fh);
-                id
-            };
-            reply.opened(id, flags as u32);
-        } else {
-            reply.error(ENOENT);
+        match RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+            }
+            let rt_ref = rt.borrow();
+            let runtime = rt_ref.as_ref().unwrap();
+
+            runtime.block_on(self.get_entry_by_inode(ino))
+        }) {
+            Some((entry, _)) => {
+                let mut fh_map = self.inner.fh_map.write().unwrap();
+                let id = if let Some(id) = fh_map.inode_to_fh.get(&ino).map(|fh| fh.id()) {
+                    *fh_map.ref_count.get_mut(&id).unwrap() += 1;
+                    id
+                } else {
+                    let id = rand::random::<u64>();
+                    let fh = FileHandle::new(self.clone(), id, ino, entry).unwrap();
+                    fh_map.fh_to_inode.insert(fh.id(), ino);
+                    fh_map.ref_count.insert(fh.id(), 1);
+                    fh_map.inode_to_fh.insert(ino, fh);
+                    id
+                };
+                reply.opened(id, flags as u32);
+            }
+            None => {
+                reply.error(ENOENT);
+            }
         }
     }
 
@@ -588,6 +638,37 @@ impl Filesystem for Wfs {
         }
     }
 
+    fn flush(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        let fh = self.get_handle_by_id(fh);
+        if fh.is_none() {
+            reply.error(ENOENT);
+            return;
+        }
+
+        let file_handle = fh.unwrap();
+        match RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+            }
+            let runtime = rt.borrow();
+            runtime.as_ref().unwrap().block_on( file_handle.flush())
+        }) {
+            Ok(_) => {
+                reply.ok();
+            }
+            Err(_) => {
+                reply.error(ENOENT);
+            }
+        }
+    }
+
     fn getattr(
         &mut self, 
         _req: &Request, 
@@ -595,13 +676,24 @@ impl Filesystem for Wfs {
         _fh: Option<u64>, 
         reply: ReplyAttr
     ) {
-        if let Some((entry, _)) = self.get_entry_by_inode(ino) {
-            reply.attr(
-                &Duration::from_secs(119),
-                &EntryAttr::from((entry, ino, true)).into()
-            );
-        } else {
-            reply.error(ENOENT);
+        match RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+            }
+            let rt_ref = rt.borrow();
+            let runtime = rt_ref.as_ref().unwrap();
+
+            runtime.block_on(self.get_entry_by_inode(ino))
+        }) {
+            Some((entry, _)) => {
+                reply.attr(
+                    &Duration::from_secs(119),
+                    &EntryAttr::from((entry, ino, true)).into()
+                );
+            }
+            None => {
+                reply.error(ENOENT);
+            }
         }
 
     }
@@ -624,57 +716,76 @@ impl Filesystem for Wfs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        if let Some((mut entry, fh)) = self.get_entry_by_inode(ino) {
-            // TODO: wormEnforced
-            let mut update_chunks = false;
-            if let Some(size) = size {
-                update_chunks = entry.truncate(size);
+        match RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
             }
+            let rt_ref = rt.borrow();
+            let runtime = rt_ref.as_ref().unwrap();
 
-            if let Some(mode) = mode {
-                chmod(&mut entry.attributes.as_mut().unwrap().file_mode, mode);
-            }
+            runtime.block_on(self.get_entry_by_inode(ino))
+        }) {
+            Some((mut entry, fh)) => {
+                // TODO: wormEnforced
+                    let mut update_chunks = false;
+                    if let Some(size) = size {
+                    update_chunks = entry.truncate(size);
+                }
 
-            if let Some(uid) = uid {
-                entry.attributes.as_mut().unwrap().uid = uid;
-            }
+                if let Some(mode) = mode {
+                    chmod(&mut entry.attributes.as_mut().unwrap().file_mode, mode);
+                }
 
-            if let Some(gid) = gid {
-                entry.attributes.as_mut().unwrap().gid = gid;
-            }
+                if let Some(uid) = uid {
+                    entry.attributes.as_mut().unwrap().uid = uid;
+                }
 
-            if let Some(mtime) = mtime {
-                entry.attributes.as_mut().unwrap().mtime = to_unix_time(mtime);
-            }
+                if let Some(gid) = gid {
+                    entry.attributes.as_mut().unwrap().gid = gid;
+                }
 
-            if let Some(atime) = atime {
-                entry.attributes.as_mut().unwrap().mtime = to_unix_time(atime);
-            }
+                if let Some(mtime) = mtime {
+                    entry.attributes.as_mut().unwrap().mtime = to_unix_time(mtime);
+                }
 
-            if let Some(fh) = fh {
-                match fh.update_entry(entry.clone(), update_chunks) {
+                if let Some(atime) = atime {
+                    entry.attributes.as_mut().unwrap().mtime = to_unix_time(atime);
+                }
+
+                if let Some(fh) = fh {
+                    match fh.update_entry(entry.clone(), update_chunks) {
+                        Ok(_) => (),
+                        Err(_) => {
+                            reply.error(ENOENT);
+                            return;
+                        }
+                    }
+                }
+
+                match RUNTIME.with(|rt| {
+                    if rt.borrow().is_none() {
+                        *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+                    }
+                    let rt_ref = rt.borrow();
+                    let runtime = rt_ref.as_ref().unwrap();
+
+                    runtime.block_on(self.filer_client().update_entry(entry.clone()))
+                }) {
                     Ok(_) => (),
                     Err(_) => {
                         reply.error(ENOENT);
                         return;
                     }
                 }
-            }
 
-            match self.filer_client().update_entry(entry.clone()) {
-                Ok(_) => (),
-                Err(_) => {
-                    reply.error(ENOENT);
-                    return;
-                }
+                reply.attr(
+                    &Duration::from_secs(119),
+                    &EntryAttr::from((entry, ino, true)).into()
+                );
             }
-
-            reply.attr(
-                &Duration::from_secs(119),
-                &EntryAttr::from((entry, ino, true)).into()
-            );
-        } else {
-            reply.error(ENOENT);
+            None => {
+                reply.error(ENOENT);
+            }
         }
     }
 }
