@@ -1,3 +1,4 @@
+use std::fmt;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::path::Path;
@@ -86,21 +87,31 @@ pub struct FilerClient {
     max_retries: u32,
 }
 
+impl fmt::Display for FilerClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FilerClient")
+    }
+}
+
 impl FilerClient {
-    pub async fn connect<D>(addresses: Vec<D>) -> Result<Self> 
-    where
-        D: TryInto<tonic::transport::Endpoint>,
-        D::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
+    pub async fn connect(addresses: Vec<String>) -> Result<Self> {
         let mut clients = Vec::new();
                 
         for addr in addresses {
-            let endpoint = tonic::transport::Endpoint::new(addr)?
+            let endpoint = tonic::transport::Endpoint::new(addr.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to create endpoint for address: {} {}", addr, e)
+                })?
                 .timeout(Duration::from_secs(30))
                 .tcp_keepalive(Some(Duration::from_secs(60)))
                 .http2_keep_alive_interval(Duration::from_secs(30));
                 
-            let channel = endpoint.connect().await?;
+            let channel = endpoint.connect().await
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to connect to endpoint: {} {}", addr, e)
+                })?;
+            
+            log::info!("FilerClient Connected to endpoint: {}", addr);
             clients.push(SeaweedFilerClient::new(channel));
         }
 

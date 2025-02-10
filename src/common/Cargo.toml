@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+log = "0.4"
 tonic = "0.12"
 prost = "0.13"
 anyhow = "1.0"
-lru = "0.12"
-ureq = "2.10"
+lru = "0.13"
+ureq = "3.0"
 hex = "0.4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 reqwest = { version = "0.12", features = ["json", "stream", "native-tls-vendored"] }

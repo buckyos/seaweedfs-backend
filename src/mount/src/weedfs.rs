@@ -1,6 +1,6 @@
 use anyhow::Result;
 use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *}};
-use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, str::FromStr};
+use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, future::Future, str::FromStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,15 +13,36 @@ use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
 use crate::file::{FileHandle, FileHandleId, FileHandleOwner};
 use crate::path::{InodeToPath, ROOT_INODE};
-use rand::seq::SliceRandom;
+use rand::seq::{SliceRandom};
 use std::thread_local;
 use std::cell::RefCell;
 use tokio::runtime::Runtime;
+use std::os::unix::fs::MetadataExt;
 
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
 }
 
+
+pub fn with_thread_local_runtime<F: Future>(f: F) -> F::Output {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // log::trace!("using existing tokio runtime");
+        handle.block_on(f)
+    } else {
+        RUNTIME.with(|rt| {
+            if rt.borrow().is_none() {
+                // log::trace!("creating tokio runtime");
+                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
+            } else {
+                // log::trace!("using existing created tokio runtime");
+            }
+
+            let rt_ref = rt.borrow();
+            let runtime = rt_ref.as_ref().unwrap();
+            runtime.block_on(f)
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeServerAccess {
@@ -30,17 +51,14 @@ pub enum VolumeServerAccess {
     Url,
 }
 
+#[derive(Debug)]
 pub struct WfsOption {
     pub filer_addresses: Vec<String>,
     pub chunk_size_limit: usize,
     pub concurrent_writers: usize,
+    pub dir: PathBuf,
+    pub dir_auto_create: bool,
     pub filer_mount_root_path: PathBuf,
-
-    pub mount_mtime: SystemTime,
-    pub mount_ctime: SystemTime,
-    pub mount_mode: u32,
-    pub mount_uid: u32,
-    pub mount_gid: u32,
 
     pub replication: String,
     pub collection: String,
@@ -51,6 +69,25 @@ pub struct WfsOption {
     pub volume_server_access: VolumeServerAccess,
 }
 
+impl Default for WfsOption {
+    fn default() -> Self {
+        Self {
+            filer_addresses: vec!["localhost:8888".to_string()],
+            filer_mount_root_path: PathBuf::from("/"),
+            dir: PathBuf::from("/"),
+            dir_auto_create: true,
+            chunk_size_limit: 2 * 1024 * 1024,
+            concurrent_writers: 32,
+            ttl: Duration::from_secs(0),
+            replication: "".to_string(),
+            collection: "".to_string(),
+            disk_type: "".to_string(),
+            data_center: "".to_string(),
+            volume_server_access: VolumeServerAccess::Url,
+        }
+    }
+}
+
 struct FileHandleInodeMap {
     ref_count: BTreeMap<FileHandleId, usize>,
     inode_to_fh: BTreeMap<u64, FileHandle<Wfs>>,
@@ -58,7 +95,12 @@ struct FileHandleInodeMap {
 }
 
 struct WfsInner {
-    option: WfsOption,
+    option: WfsOption, 
+    mount_mtime: SystemTime,
+    mount_ctime: SystemTime,
+    mount_mode: u32,
+    mount_uid: u32,
+    mount_gid: u32,
     filer_client: FilerClient,
     inode_to_path: RwLock<InodeToPath>,
     fh_map: RwLock<FileHandleInodeMap>, 
@@ -83,10 +125,56 @@ const BLOCK_SIZE: u32 = 512;
 
 
 impl Wfs {
+    pub fn mount(option: WfsOption) -> Result<()> {
+        log::info!("Mounting Wfs with option: {:?}", option);
+        let path = option.dir.clone(); 
+        let wfs = with_thread_local_runtime(Self::new(option))
+            .map_err(|e| {
+                log::error!("Failed to mount Wfs: {}", e);
+                e
+            })?;
+        fuser::mount2(wfs, &path, &[])
+            .map_err(|e| {
+                log::error!("Failed to mount Wfs: {}", e);
+                e
+            })?;
+        Ok(())
+    }
+    
     pub async fn new(option: WfsOption) -> Result<Self> {
-        let filer_client = FilerClient::connect(option.filer_addresses.clone()).await?;
+        if option.dir_auto_create && !option.dir.exists() {
+            log::info!("Creating directory: {:?}", option.dir);
+            std::fs::create_dir_all(&option.dir)
+                .map_err(|e| {
+                    log::error!("Failed to create directory: {}", e);
+                    e
+                })?;
+        }
+        let dir_meta = option.dir.metadata()
+            .map_err(|e| {
+                log::error!("Failed to get directory metadata: {}", e);
+                e
+            })?;
+        
+        let filer_gprc_addresses = option.filer_addresses.clone().into_iter().map(|addr| {
+            let mut parts = addr.split(':');
+            let host = parts.next().unwrap_or("localhost");
+            let port = parts.next().unwrap_or("8888").parse::<u16>().unwrap_or(8888);
+            format!("http://{}:{}", host, port + 10000)
+        }).collect();
+        let filer_client = FilerClient::connect(filer_gprc_addresses).await
+            .map_err(|e| {
+                log::error!("Failed to connect to filer: {}", e);
+                e
+            })?;
+
         Ok(Self {
             inner: Arc::new(WfsInner {
+                mount_mode: OS_MODE_DIR | 0o777, 
+                mount_uid: dir_meta.uid(),
+                mount_gid: dir_meta.gid(),
+                mount_mtime: SystemTime::now(), 
+                mount_ctime: dir_meta.modified()?, 
                 filer_client,
                 inode_to_path: RwLock::new(InodeToPath::new(option.filer_mount_root_path.clone())),
                 fh_map: RwLock::new(FileHandleInodeMap {
@@ -113,6 +201,8 @@ impl Wfs {
         &self.inner.filer_client
     }
 
+    
+
     fn get_handle_by_id(&self, id: FileHandleId) -> Option<FileHandle<Self>> {
         let fh_map = self.inner.fh_map.read().unwrap();
         fh_map.fh_to_inode.get(&id).and_then(|inode| fh_map.inode_to_fh.get(&inode)).cloned()
@@ -129,11 +219,11 @@ impl Wfs {
                 name: "".to_string(),
                 is_directory: true,
                 attributes: Some(FuseAttributes {
-                    mtime: self.option().mount_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    file_mode: self.option().mount_mode,
-                    uid: self.option().mount_uid,
-                    gid: self.option().mount_gid,
-                    crtime: self.option().mount_ctime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                    mtime: self.inner.mount_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                    file_mode: self.inner.mount_mode,
+                    uid: self.inner.mount_uid,
+                    gid: self.inner.mount_gid,
+                    crtime: self.inner.mount_ctime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -156,11 +246,11 @@ impl Wfs {
                name: "".to_string(),
                is_directory: true,
                attributes: Some(FuseAttributes {
-                    mtime: self.option().mount_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    file_mode: self.option().mount_mode,
-                    uid: self.option().mount_uid,
-                    gid: self.option().mount_gid,
-                    crtime: self.option().mount_ctime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                    mtime: self.inner.mount_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                    file_mode: self.inner.mount_mode,
+                    uid: self.inner.mount_uid,
+                    gid: self.inner.mount_gid,
+                    crtime: self.inner.mount_ctime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
                     ..Default::default()
                }),
                ..Default::default()
@@ -232,15 +322,7 @@ impl Wfs {
 
 impl LookupFileId for Wfs {
     fn lookup(&self, file_id: &str) -> Result<Vec<String>> {
-        RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            }
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-
-            runtime.block_on(self.lookup_volume(file_id))
-        })
+        with_thread_local_runtime(self.lookup_volume(file_id))
     }
 }
 
@@ -442,6 +524,59 @@ fn to_unix_time(time: TimeOrNow) -> i64 {
 }
 
 impl Filesystem for Wfs {
+    fn lookup(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        log::trace!("lookup: parent: {}, name: {}", parent, name.to_string_lossy());
+        let full_path = {
+            let inode_to_path = self.inner.inode_to_path.read().unwrap();
+            let dir_path = inode_to_path.get_path(parent);
+            if dir_path.is_none() {
+                log::trace!("lookup: parent not found, parent: {}", parent);
+                reply.error(ENOENT);
+                return;
+            }
+            let dir_path = dir_path.unwrap();
+            dir_path.join(name)
+        };
+
+        let entry = with_thread_local_runtime(self.get_entry_by_path(full_path.as_path()));
+        
+        if entry.is_none() {
+            log::trace!("lookup: entry not found, path: {}", full_path.to_string_lossy());
+            reply.error(ENOENT);
+            return;
+        }
+        let mut entry = entry.unwrap();
+        let inode= self.inner.inode_to_path.write().unwrap()
+            .lookup(
+                full_path.as_path(), 
+                entry.attributes.as_ref().unwrap().crtime as u64, 
+                entry.is_directory, 
+                entry.hard_link_counter > 0, 
+                entry.attributes.as_ref().unwrap().inode, 
+                true
+            );
+        log::trace!("lookup: parent: {}, name: {}, inode: {}", parent, name.to_string_lossy(), inode);
+
+        if let Some(file_handle) = self.get_handle_by_inode(inode) {
+            log::trace!("lookup: parent: {}, name: {}, inode: {}, found file handle", parent, name.to_string_lossy(), inode);
+            entry = file_handle.entry();
+        }
+
+        reply.entry(
+            &self.option().ttl, 
+            &EntryAttr::from((entry, inode, true)).into(), 
+            1
+        );
+
+    }
+
+
     fn mknod(
         &mut self,
         _req: &Request<'_>,
@@ -452,8 +587,10 @@ impl Filesystem for Wfs {
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        log::trace!("mknod: parent: {}, name: {}, mode: {}, umask: {}, rdev: {}", parent, name.to_string_lossy(), mode, _umask, rdev);
         let dir_full_path = self.get_path(parent);
         if dir_full_path.is_none() {
+            log::trace!("mknod: parent not found, parent: {}", parent);
             reply.error(ENOENT);
             return;
         }
@@ -483,17 +620,12 @@ impl Filesystem for Wfs {
 
         
 
-        match RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            }
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-
-            runtime.block_on(self.filer_client().create_entry(entry_full_path.as_path(), &entry))
-        }) {
+        match with_thread_local_runtime(
+            self.filer_client().create_entry(entry_full_path.as_path(), &entry)
+        ) {
             Ok(_) => (),
-            Err(_) => {
+            Err(e) => {
+                log::trace!("mknod: parent: {}, name: {}, create entry failed, error: {}", parent, name.to_string_lossy(), e);
                 reply.error(ENOENT);
                 return;
             }
@@ -521,15 +653,10 @@ impl Filesystem for Wfs {
         flags: i32,
         reply: ReplyOpen,
     ) {
-        match RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            }
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-
-            runtime.block_on(self.get_entry_by_inode(ino))
-        }) {
+        log::trace!("open: ino: {}, flags: {}", ino, flags);
+        match with_thread_local_runtime(
+            self.get_entry_by_inode(ino)
+        ) {
             Some((entry, _)) => {
                 let mut fh_map = self.inner.fh_map.write().unwrap();
                 let id = if let Some(id) = fh_map.inode_to_fh.get(&ino).map(|fh| fh.id()) {
@@ -653,13 +780,7 @@ impl Filesystem for Wfs {
         }
 
         let file_handle = fh.unwrap();
-        match RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            }
-            let runtime = rt.borrow();
-            runtime.as_ref().unwrap().block_on( file_handle.flush())
-        }) {
+        match with_thread_local_runtime(file_handle.flush()) {
             Ok(_) => {
                 reply.ok();
             }
@@ -676,18 +797,13 @@ impl Filesystem for Wfs {
         _fh: Option<u64>, 
         reply: ReplyAttr
     ) {
-        match RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            }
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-
-            runtime.block_on(self.get_entry_by_inode(ino))
-        }) {
+        log::trace!("getattr: ino: {}", ino);
+        match with_thread_local_runtime(
+            self.get_entry_by_inode(ino)
+        ) {
             Some((entry, _)) => {
                 reply.attr(
-                    &Duration::from_secs(119),
+                    &self.option().ttl,
                     &EntryAttr::from((entry, ino, true)).into()
                 );
             }
@@ -716,15 +832,9 @@ impl Filesystem for Wfs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        match RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            }
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-
-            runtime.block_on(self.get_entry_by_inode(ino))
-        }) {
+        match with_thread_local_runtime(
+            self.get_entry_by_inode(ino)
+        ) {
             Some((mut entry, fh)) => {
                 // TODO: wormEnforced
                     let mut update_chunks = false;
@@ -762,15 +872,9 @@ impl Filesystem for Wfs {
                     }
                 }
 
-                match RUNTIME.with(|rt| {
-                    if rt.borrow().is_none() {
-                        *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-                    }
-                    let rt_ref = rt.borrow();
-                    let runtime = rt_ref.as_ref().unwrap();
-
-                    runtime.block_on(self.filer_client().update_entry(entry.clone()))
-                }) {
+                match with_thread_local_runtime(
+                    self.filer_client().update_entry(entry.clone())
+                ) {
                     Ok(_) => (),
                     Err(_) => {
                         reply.error(ENOENT);
@@ -779,7 +883,7 @@ impl Filesystem for Wfs {
                 }
 
                 reply.attr(
-                    &Duration::from_secs(119),
+                    &self.option().ttl,
                     &EntryAttr::from((entry, ino, true)).into()
                 );
             }

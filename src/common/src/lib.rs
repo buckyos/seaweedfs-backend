@@ -1,3 +1,4 @@
+extern crate log;
 pub mod pb;
 pub mod chunks;
 mod chunk_group;

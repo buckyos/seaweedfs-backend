@@ -9,7 +9,6 @@ use std::io::Write;
 use prost::Message;
 use crate::pb::filer_pb::{FileChunk, FileChunkManifest};
 use crate::interval_list::{Interval, IntervalList, IntervalValue};
-use ureq::AgentBuilder;
 use std::time::Duration;
 
 pub trait LookupFileId {
@@ -249,9 +248,9 @@ pub fn retried_fetch_chunk_data(
     offset: i64, 
     size: usize
 ) -> Result<usize> {
-    let agent = AgentBuilder::new()
-        .timeout_read(Duration::from_secs(30))
-        .build();
+    let agent = ureq::config::Config::builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build().new_agent();
     let mut last_err = None;
     let mut wait_time = Duration::from_secs(1);
     const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -261,20 +260,20 @@ pub fn retried_fetch_chunk_data(
             let mut req = agent.get(url);
 
             if !is_full_chunk {
-                req = req.set("Range", &format!("bytes={}-{}", offset, offset + size as i64 - 1));
+                req = req.header("Range", &format!("bytes={}-{}", offset, offset + size as i64 - 1));
             }
 
             match req.call() {
                 Ok(resp) => {
                     let status = resp.status();
-                    if !(200..300).contains(&status) {
-                        if status >= 500 {
+                    if !status.is_success() {
+                        if status.is_server_error() {
                             continue;
                         }
                         return Err(anyhow::anyhow!("{}: {}", url, status));
                     }
 
-                    let n = std::io::copy(&mut resp.into_reader(), &mut writer)?;
+                    let n = std::io::copy(&mut resp.into_body().as_reader(), &mut writer)?;
                     return Ok(n as usize);
                 }
                 Err(e) => {
