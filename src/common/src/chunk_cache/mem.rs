@@ -24,9 +24,10 @@ impl ChunkCache for ChunkCacheInMem {
         if let Some(data) = cache.get(file_id) {
             let wanted = buffer.len().min(data.len().saturating_sub(offset));
             buffer[..wanted].copy_from_slice(&data[offset..offset + wanted]);
-            return Ok(wanted);
+            Ok(wanted)
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"))
         }
-        Ok(0)
     }
 
     fn exists(&self, file_id: &str) -> bool {

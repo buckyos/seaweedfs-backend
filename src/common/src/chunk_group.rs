@@ -1,5 +1,6 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 use std::sync::{Mutex, RwLock};
 use anyhow::Result;
 use crate::pb::filer_pb::FileChunk;
@@ -50,6 +51,13 @@ struct SectionMutPart {
     reader_pattern: ReaderPattern,
     last_chunk_fid: Option<String>,
 }
+
+impl fmt::Debug for FileChunkSection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FileChunkSection {{ index: {} }}", self.section_index)
+    }
+}
+
 struct FileChunkSection {
     section_index: SectionIndex,
     chunks: Vec<FileChunk>,
@@ -143,6 +151,7 @@ impl FileChunkSection {
         next_chunk_views: impl Iterator<Item = &'a ChunkView>,
         offset: u64
     ) -> std::io::Result<usize> {
+        log::trace!("read_chunk_slice_at: section: {}, chunk: {}, offset: {}", self.section_index, chunk_view.file_id, offset);
         let mut mut_part = self.mut_part.lock().unwrap();
         if mut_part.reader_pattern.is_random_mode() {
             match reader_cache.outer_cache().read(buf, &chunk_view.file_id, offset as usize) {
@@ -150,8 +159,12 @@ impl FileChunkSection {
                 Err(e) => {
                     match e.kind() {
                         std::io::ErrorKind::NotFound => {
+                            log::trace!("read_chunk_slice_at: fetch_chunk_range: section: {}, chunk: {}", self.section_index, chunk_view.file_id);
                             return chunks::fetch_chunk_range(lookup, buf, &chunk_view.file_id, offset as i64)
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+                                .map_err(|e| {
+                                    log::trace!("read_chunk_slice_at: fetch_chunk_range: section: {}, chunk: {}, error: {}", self.section_index, chunk_view.file_id, e);
+                                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                                });
                         }
                         _ => return Err(e),
                     }
@@ -203,6 +216,7 @@ impl FileChunkSection {
             let chunk_range = max(view.value.view_offset, start)..min(view.value.view_offset + view.value.view_size as i64, start + remaining);
             ts_ns = view.ts_ns;
             let chunk_offset = chunk_range.start - view.value.view_offset + view.value.offset_in_chunk;
+            
             let n = self.read_chunk_slice_at(
                 lookup, 
                 reader_cache, 
@@ -259,6 +273,7 @@ impl<T: ChunkCache> ChunkGroup<T> {
         let mut mut_part = self.mut_part.write().unwrap();
         for chunk in chunks {
             let section_index = chunk.offset as u64 / SECTION_SIZE;
+            log::trace!("add_chunks: section_index: {}, chunk: {}", section_index, chunk.file_id);
             mut_part.sections.entry(section_index).or_insert(FileChunkSection::new(section_index, vec![])).add_chunk(chunk);
         }
     }

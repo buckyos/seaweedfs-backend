@@ -1,4 +1,5 @@
-use std::fmt;
+use std::task::{Context, Poll};
+use std::{fmt, pin::Pin};
 use std::cmp::max;
 use std::collections::HashMap;
 use std::path::Path;
@@ -6,8 +7,9 @@ use std::str::FromStr;
 use std::time::Duration;
 use anyhow::Result;
 use tokio::time::sleep;
-use tonic::transport::Channel;
+use tonic::{transport::Channel, Streaming};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use futures::stream::Stream;
 
 use super::filer_pb::{*, seaweed_filer_client::*};
 use crate::chunks;
@@ -74,9 +76,27 @@ impl FromStr for FileId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut parts = s.splitn(2, ',');
-        let volume_id = parts.next().unwrap().parse::<u32>()?;
-        let file_key = parts.next().unwrap().parse::<u64>()?;
-        let cookie = parts.next().unwrap().parse::<u32>()?;
+        let volume_id = parts.next()
+            .ok_or_else(|| anyhow::anyhow!("missing volume id"))?
+            .parse::<u32>()
+            .map_err(|e| anyhow::anyhow!("invalid volume id: {}", e))?;
+            
+        let hex_str = parts.next()
+            .ok_or_else(|| anyhow::anyhow!("missing file key and cookie"))?;
+        let mut bytes = hex::decode(hex_str)
+            .map_err(|e| anyhow::anyhow!("invalid hex string: {}", e))?;
+            
+        if bytes.len() < 12 {
+            let mut padded = vec![0; 12];
+            padded[12 - bytes.len()..].copy_from_slice(&bytes);
+            bytes = padded;
+        }
+        
+        let file_key = u64::from_be_bytes(bytes[..8].try_into()
+            .map_err(|e| anyhow::anyhow!("failed to parse file key: {}", e))?);
+        let cookie = u32::from_be_bytes(bytes[8..12].try_into()
+            .map_err(|e| anyhow::anyhow!("failed to parse cookie: {}", e))?);
+
         Ok(FileId { volume_id, file_key, cookie })
     }
 }
@@ -244,6 +264,44 @@ impl FilerClient {
             async move {
                 let _ = client.update_entry(req).await?;
                 Ok(())
+            }
+        }).await
+    }
+
+    pub async fn list_entries(&self, path: &Path, start_from: &str, limit: Option<u32>) -> Result<impl Stream<Item = Result<Option<Entry>>>> {
+        struct ListEntriesStream(Streaming<ListEntriesResponse>);
+        
+        impl Stream for ListEntriesStream {
+            type Item = Result<Option<Entry>>;
+
+            fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                let stream = &mut self.get_mut().0;
+                match Pin::new(stream).poll_next(cx) {
+                    Poll::Ready(Some(Ok(response))) => {
+                        Poll::Ready(Some(Ok(response.entry)))
+                    },
+                    Poll::Ready(Some(Err(e))) => {
+                        Poll::Ready(Some(Err(anyhow::anyhow!("http status: {}", e))))
+                    },
+                    Poll::Ready(None) => {
+                        Poll::Ready(None)
+                    },
+                    _ => Poll::Pending,
+                }
+            }
+        }
+
+        self.with_retry(|mut client| {
+            let req = ListEntriesRequest {
+                directory: path.to_string_lossy().to_string(),
+                start_from_file_name: start_from.to_string(),
+                inclusive_start_from: false,
+                limit: limit.unwrap_or(u32::MAX),
+                prefix: "".to_string(),
+            };
+            async move {
+                let response = client.list_entries(req).await?;
+                Ok(ListEntriesStream(response.into_inner()))
             }
         }).await
     }

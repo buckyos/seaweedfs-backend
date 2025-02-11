@@ -9,12 +9,12 @@ pub trait PathExt {
 }
 
 impl PathExt for &Path {
-    fn as_inode(&self, ts_ns: u64) -> u64 {
+    fn as_inode(&self, ts_secs: u64) -> u64 {
         let mut hasher = Md5::new();
         hasher.update(self.to_string_lossy().as_bytes());
         let hash = hasher.finalize();
         let hash_bytes: [u8; 8] = hash[..8].try_into().unwrap();
-        u64::from_le_bytes(hash_bytes) + ts_ns * 37
+        u64::from_le_bytes(hash_bytes) + ts_secs * 37
     }
 }
 
@@ -37,6 +37,10 @@ impl InodeToPath {
         }
     }
 
+    pub fn has_inode(&self, inode: u64) -> bool {
+        self.inode_to_path.contains_key(&inode)
+    }
+
     pub fn get_path(&self, inode: u64) -> Option<&Path> {
         self.inode_to_path.get(&inode).and_then(|entry| entry.path.first().map(|p| p.as_path()))
     }
@@ -55,7 +59,7 @@ impl InodeToPath {
     pub fn lookup(
         &mut self, 
         path: &Path, 
-        ts_ns: u64, 
+        ts_secs: u64, 
         is_directory: bool, 
         is_hardlink: bool, 
         possible_inode: u64, 
@@ -65,7 +69,7 @@ impl InodeToPath {
             exists_inode
         } else {
             let mut inode = if possible_inode == 0 {
-                path.as_inode(ts_ns)
+                path.as_inode(ts_secs)
             } else {
                 possible_inode
             };

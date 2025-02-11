@@ -52,9 +52,9 @@ impl PageWriter {
         }
     }
 
-    fn is_sequential_mode(&self) -> bool {
-        self.is_sequential_counter >= 0
-    }
+    // fn is_sequential_mode(&self) -> bool {
+    //     self.is_sequential_counter >= 0
+    // }
 
     pub fn get_sealed(&self, chunk_index: i64, ts_ns: u64) -> Option<SealedMemPage> {
         self.sealed_chunks.get(&chunk_index).and_then(|page| {

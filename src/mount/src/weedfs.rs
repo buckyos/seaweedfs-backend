@@ -2,12 +2,12 @@ use anyhow::Result;
 use dfs_common::pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *};
 use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, future::Future, str::FromStr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
 };
-use libc::{ENOENT, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
+use libc::{ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
@@ -18,6 +18,7 @@ use std::thread_local;
 use std::cell::RefCell;
 use tokio::runtime::Runtime;
 use std::os::unix::fs::MetadataExt;
+use futures::stream::StreamExt;
 
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
@@ -94,6 +95,23 @@ struct FileHandleInodeMap {
     fh_to_inode: BTreeMap<FileHandleId, u64>,
 }
 
+
+pub type DirectoryHandleId = u64;
+
+pub enum DirectoryHandle {
+    Init, 
+    Reading {
+        is_finished: bool,
+        last_name: String,
+        last_offset: i64,
+    },
+    Finished {
+        last_offset: i64,
+    },
+    Error(String),
+}
+
+
 struct WfsInner {
     option: WfsOption, 
     mount_mtime: SystemTime,
@@ -104,6 +122,7 @@ struct WfsInner {
     filer_client: FilerClient,
     inode_to_path: RwLock<InodeToPath>,
     fh_map: RwLock<FileHandleInodeMap>, 
+    dh_map: RwLock<BTreeMap<DirectoryHandleId, Arc<Mutex<DirectoryHandle>>>>,
     chunk_cache: ChunkCacheInMem, 
     volume_location_cache: RwLock<HashMap<String, (Vec<String>, Vec<String>)>>,
 }
@@ -182,6 +201,7 @@ impl Wfs {
                     inode_to_fh: BTreeMap::new(),
                     fh_to_inode: BTreeMap::new(),
                 }),
+                dh_map: RwLock::new(BTreeMap::new()),
                 chunk_cache: ChunkCacheInMem::new(1024), 
                 volume_location_cache: RwLock::new(HashMap::new()),
                 option,
@@ -212,6 +232,10 @@ impl Wfs {
         let fh_map = self.inner.fh_map.read().unwrap();
         fh_map.inode_to_fh.get(&inode).cloned()
     }
+
+    fn has_inode(&self, inode: u64) -> bool {
+        self.inner.inode_to_path.read().unwrap().has_inode(inode)
+    }        
 
     async fn get_entry_by_inode(&self, inode: u64) -> Option<(Entry, Option<FileHandle<Self>>)> {
         if inode == ROOT_INODE {
@@ -272,7 +296,10 @@ impl Wfs {
             },
         };
         
-        let file_id = FileId::from_str(file_id)?;
+        let file_id = FileId::from_str(file_id)
+            .map_err(|e| {
+                anyhow::anyhow!("invalid file id: {}", e)
+            })?;
         let vid = file_id.volume_id.to_string();
         let cached_locations = {
             let vid_cache = self.inner.volume_location_cache.read().unwrap();
@@ -286,7 +313,10 @@ impl Wfs {
         let (mut same_dc_locations, mut other_locations) = if let Some(locations) = cached_locations {
             locations
         } else {
-            let mut locations = self.filer_client().lookup_volume(vec![vid.clone()]).await?;
+            let mut locations = self.filer_client().lookup_volume(vec![vid.clone()]).await
+                .map_err(|e| {
+                    anyhow::anyhow!("lookup volume on filer failed: {}", e)
+                })?;
             if locations.is_empty() {
                 return Err(anyhow::anyhow!("no locations found for volume {}", vid));
             }
@@ -296,15 +326,15 @@ impl Wfs {
             for location in locations.locations {
                 if location.data_center == self.option().data_center {
                     if pulic_url {
-                        same_dc_locations.push(location.public_url);
+                        same_dc_locations.push(format!("http://{}/{}", location.public_url, file_id.to_string()));
                     } else {
-                        same_dc_locations.push(location.url);
+                        same_dc_locations.push(format!("http://{}/{}", location.url, file_id.to_string()));
                     }
                 } else {
                     if pulic_url {
-                        other_locations.push(location.public_url);
+                        other_locations.push(format!("http://{}/{}", location.public_url, file_id.to_string()));
                     } else {
-                        other_locations.push(location.url);
+                        other_locations.push(format!("http://{}/{}", location.url, file_id.to_string()));
                     }
                 }
             }
@@ -317,6 +347,76 @@ impl Wfs {
         other_locations.shuffle(&mut rand::rng());
         same_dc_locations.append(&mut other_locations);
         Ok(same_dc_locations)
+    }
+
+    async fn list_entries(&self, mut reply: ReplyDirectory, path: PathBuf, fh: DirectoryHandleId, handle: Arc<Mutex<DirectoryHandle>>, start_from: String, is_plus: bool) {
+        let mut dh = handle.lock().unwrap();
+        let mut last_offset = match &*dh {
+            DirectoryHandle::Init => {
+                2
+            },
+            DirectoryHandle::Reading { last_offset, .. } => {
+                *last_offset
+            }, 
+            _ => {
+                unreachable!()
+            }
+        };
+        match self.filer_client().list_entries(path.as_path(), &start_from, None).await {
+            Err(e) => {
+                log::trace!("list_entries: fh {} error", fh);
+                *dh = DirectoryHandle::Error(e.to_string());
+                reply.error(EIO);
+            }
+            Ok(mut entries) => {
+                while let Some(entry) = entries.next().await {
+                    last_offset += 1;
+                    match entry {
+                        Ok(Some(entry)) => {
+                            log::trace!("list_entries: fh {} entry: {}", fh, entry.name);
+                            let inode = self.inner.inode_to_path.write().unwrap().lookup(
+                                &path.join(&entry.name), 
+                                entry.attributes.as_ref().unwrap().mtime as u64, 
+                                entry.is_directory, 
+                                entry.hard_link_counter > 0, 
+                                entry.attributes.as_ref().unwrap().inode,
+                                 is_plus
+                            );
+                            let full = reply.add(
+                                inode, 
+                                last_offset, 
+                                to_syscall_type(entry.attributes.as_ref().unwrap().file_mode), 
+                                &entry.name
+                            );
+                            if full {
+                                *dh = DirectoryHandle::Reading {
+                                    is_finished: false,
+                                    last_name: entry.name,
+                                    last_offset,
+                                };
+                                reply.ok();
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            log::trace!("list_entries: fh {} finished", fh);
+                            *dh = DirectoryHandle::Finished { last_offset };
+                            reply.ok();
+                            return;
+                        }
+                        Err(e) => {
+                            *dh = DirectoryHandle::Error(e.to_string());
+                            reply.error(EIO);
+                            return; 
+                        }
+                    }
+                }
+
+                log::trace!("list_entries: fh {} finished", fh);
+                *dh = DirectoryHandle::Finished { last_offset };
+                reply.ok();
+            }
+        }
     }
 }
 
@@ -537,6 +637,134 @@ fn to_unix_time(time: TimeOrNow) -> i64 {
 }
 
 impl Filesystem for Wfs {
+    fn opendir(
+        &mut self, 
+        _req: &Request<'_>, 
+        ino: u64, 
+        flags: i32, 
+        reply: ReplyOpen
+    ) {
+        if !self.has_inode(ino) {
+            reply.error(ENOENT);
+            return;
+        }
+        let mut dh_map = self.inner.dh_map.write().unwrap();
+        let id = rand::random::<u64>();
+        dh_map.insert(id, Arc::new(Mutex::new(DirectoryHandle::Init)));
+        reply.opened(id, flags as u32);
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        let mut dh_map = self.inner.dh_map.write().unwrap();
+        dh_map.remove(&fh);
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,  // 改为 bool 类型
+        reply: ReplyEmpty,
+    ) { 
+        reply.ok();
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        mut offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let dh = self.inner.dh_map.read().unwrap().get(&fh).cloned();
+        if dh.is_none() {
+            log::trace!("readdir: fh not found, fh: {}", fh);
+            reply.error(ENOENT);
+            return;
+        }
+
+        if offset == 0 {
+            offset = 1;
+            if reply.add(
+                ino,
+                offset,
+                FileType::Directory,
+                "."
+            ) {
+                reply.ok();
+                return;
+            }
+        }
+
+        if offset == 1 {
+            offset = 2;
+            if reply.add(
+                ino,
+                offset,
+                FileType::Directory,
+                ".."
+            ) {
+                reply.ok();
+                return;
+            }
+        }
+
+        let path = self.get_path(ino).unwrap();
+        let dh = dh.unwrap();
+        let last_name = {
+            let dh = dh.lock().unwrap();
+            match &*dh {
+                DirectoryHandle::Init => {
+                   "".to_string()
+                }
+                DirectoryHandle::Reading { 
+                    is_finished, 
+                    last_name, 
+                    last_offset 
+                } => {
+                    if offset <= *last_offset {
+                        log::trace!("readdir: fh {} offset <= last_offset, offset: {}, last_offset: {}", fh, offset, *last_offset);
+                        reply.error(EINVAL);
+                        return; 
+                    } 
+                    if *is_finished {
+                        log::trace!("readdir: fh {} is_finished, offset: {}, last_offset: {}", fh, offset, *last_offset);
+                        reply.ok();
+                        return;
+                    }
+                    last_name.clone()
+                }
+                DirectoryHandle::Finished { last_offset } => {
+                    if offset >= *last_offset {
+                        log::trace!("readdir: fh {} offset > last_offset, offset: {}, last_offset: {}", fh, offset, *last_offset);
+                        reply.ok();
+                    } else {
+                        log::trace!("readdir: fh {} offset <= last_offset, offset: {}, last_offset: {}", fh, offset, *last_offset);
+                        reply.error(EINVAL);
+                    }
+                    return; 
+                }
+                DirectoryHandle::Error(_) => {
+                    log::trace!("readdir: fh {} exsiting error", fh);
+                    reply.error(EIO);
+                    return;
+                }
+            }
+        };
+
+        with_thread_local_runtime(self.list_entries(reply, path, fh, dh, last_name, false));
+    }
+
     fn lookup(
         &mut self,
         _req: &Request<'_>,
@@ -677,6 +905,7 @@ impl Filesystem for Wfs {
                     id
                 } else {
                     let id = rand::random::<u64>();
+                    log::trace!("open: ino: {}, id: {}, chunks: {}", ino, id, entry.chunks.len());
                     let fh = FileHandle::new(self.clone(), id, ino, entry).unwrap();
                     fh_map.fh_to_inode.insert(fh.id(), ino);
                     fh_map.ref_count.insert(fh.id(), 1);

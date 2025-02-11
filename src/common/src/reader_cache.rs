@@ -127,6 +127,7 @@ impl<T: ChunkCache> ReaderCache<T> {
         chunk_size: usize, 
         should_cache: bool
     ) -> std::io::Result<usize> {
+        log::trace!("read_at: file_id: {}, offset: {}, chunk_size: {}", file_id, offset, chunk_size);
         let downloded = {
             let mut inner_cache = self.inner.inner_cache.lock().unwrap();
             if let Some(data) = inner_cache.downloaded.get(file_id) {
@@ -142,12 +143,14 @@ impl<T: ChunkCache> ReaderCache<T> {
 
         let read = min(chunk_size - offset, buf.len());
         if let Some(data) = downloded {
+            log::trace!("read_at: downloaded: file_id: {}, offset: {}, chunk_size: {}", file_id, offset, chunk_size);
             buf[..read].copy_from_slice(&data.as_slice()[offset..read]);
             return Ok(read);
         }
         
         if should_cache {
             if let Ok(read) = self.inner.outer_cache.read(buf, file_id, offset) {
+                log::trace!("read_at: outer_cache: file_id: {}, offset: {}, chunk_size: {}", file_id, offset, chunk_size);
                 return Ok(read);
             }
         }
@@ -158,8 +161,12 @@ impl<T: ChunkCache> ReaderCache<T> {
            
             // TODO: use a buffer pool
             let mut data = vec![0u8; chunk_size];
+            log::trace!("read_at: fetch_whole_chunk: file_id: {}, offset: {}, chunk_size: {}", file_id, offset, chunk_size);    
             chunks::fetch_whole_chunk(lookup, &mut data[..], file_id)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| {
+                    log::trace!("read_at: fetch_whole_chunk: file_id: {}, offset: {}, chunk_size: {}, error: {}", file_id, offset, chunk_size, e);
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                })?;
             let data = Arc::new(data);
             if should_cache {
                 self.inner.outer_cache.set(file_id, data.clone());

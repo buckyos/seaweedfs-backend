@@ -44,6 +44,32 @@ impl IntervalValue for VisibleInterval {
     }
 }
 
+#[test]
+fn test_read_resolved_chunks() {
+    let chunks = vec![
+        FileChunk {
+            file_id: "file1".to_string(),
+            offset: 0,
+            size: 13,
+            modified_ts_ns: 1000,
+            is_chunk_manifest: false,
+            ..Default::default()
+        },
+    ];
+    let visibles = read_resolved_chunks(&chunks, 0..i64::MAX);
+    let intervals: Vec<_> = visibles.into_iter().collect();
+    
+    // 验证区间数量
+    assert_eq!(intervals.len(), 1);
+    
+    // 验证区间内容
+    let interval = &intervals[0];
+    assert_eq!(interval.range, 0..13);
+    assert_eq!(interval.ts_ns, 1000);
+    assert_eq!(interval.value.file_id, "file1");
+    assert_eq!(interval.value.offset_in_chunk, 0);
+    assert_eq!(interval.value.chunk_size, 13);
+}
 
 
 pub fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> IntervalList<VisibleInterval> {
@@ -121,22 +147,22 @@ pub fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> Interva
         } else {
             // 找到并移除对应的点
             if let Some(pos) = queue.iter().position(|p| p.ts == point.ts) {
-                queue.remove(pos);
-                if pos == queue.len() {
-                    if let Some(prev_point) = queue.last() {
-                        let chunk = prev_point.chunk;
+                let removed_point = queue.remove(pos);
+                // 如果队列为空或者移除的是最新的点，需要添加一个区间
+                if queue.is_empty() || removed_point.ts > queue.last().unwrap().ts {
+                    if prev_x < point.x {
                         visible_intervals.push_back(Interval {
                             range: prev_x..point.x,
-                            ts_ns: chunk.modified_ts_ns,
+                            ts_ns: removed_point.ts,
                             value: VisibleInterval {
-                                file_id: chunk.file_id.to_string(),
-                                offset_in_chunk: prev_x - chunk.offset,
-                                chunk_size: chunk.size,
+                                file_id: removed_point.chunk.file_id.to_string(),
+                                offset_in_chunk: prev_x - removed_point.chunk.offset,
+                                chunk_size: removed_point.chunk.size,
                             },
                         });
-                        prev_x = point.x;
                     }
                 }
+                prev_x = point.x;
             }
         }
     }
@@ -175,7 +201,11 @@ pub fn fetch_whole_chunk(
     chunks_buffer: &mut [u8],
     file_id: &str
 ) -> Result<()> {
-    let url_strings = lookup.lookup(file_id)?;
+    let url_strings = lookup.lookup(file_id)
+        .map_err(|e| {
+            log::trace!("fetch_whole_chunk: file_id: {}, lookup error: {}", file_id, e);
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
     let size = chunks_buffer.len();
     retried_fetch_chunk_data(
         Cursor::new(chunks_buffer), 
@@ -261,6 +291,7 @@ pub fn retried_fetch_chunk_data(
 
     while wait_time < MAX_WAIT {
         for url in &url_strings {
+            log::trace!("retried_fetch_chunk_data: url: {}", url);
             let mut req = agent.get(url);
 
             if !is_full_chunk {
@@ -394,6 +425,7 @@ pub async fn compact_chunks(
 ) -> Result<Vec<FileChunk>> {
     let (mut manifest_chunks, non_manifest_chunks) = separate_manifest_chunks(chunks);
     let (mut data_chunks, _) = resolve_chunks_manifest(lookup, non_manifest_chunks, 0..i64::MAX)?;
+    // log::trace!("compact_chunks: data_chunks: {}", data_chunks.iter().map(|chunk| format!("{}: {}, {}", chunk.file_id, chunk.offset, chunk.size)).collect::<Vec<_>>().join(", "));
     let visibles = read_resolved_chunks(&data_chunks, 0..i64::MAX);
     let visible_file_ids = visibles.into_iter().map(|visible| visible.value.file_id.clone()).collect::<HashSet<_>>();
     data_chunks.retain(|chunk| visible_file_ids.contains(&chunk.file_id));    

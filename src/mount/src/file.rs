@@ -127,6 +127,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
             } else if offset as u64 > file_size {
                 (0, 0)
             } else if offset < mut_part.entry.content.len() as i64 {
+                log::trace!("{:?} read from entry content: offset: {}", self, offset);
                 buff.copy_from_slice(&mut_part.entry.content[offset as usize..]);
                 let total_read = mut_part.entry.content.len() - offset as usize;
                 (total_read, 0)
@@ -166,9 +167,9 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 }
             } {
                 let mut mut_part = self.inner.mut_part.write().unwrap();
-                mut_part.page_writer.post_uploaded(chunk_index, ts_ns);
                 mut_part.chunk_group.add_chunks(chunks.clone());
                 mut_part.entry.chunks.append(&mut chunks);
+                mut_part.page_writer.post_uploaded(chunk_index, ts_ns);
             }
         }
         Ok(())
@@ -230,8 +231,10 @@ impl<T: FileHandleOwner> FileHandle<T> {
         if mut_part.dirty {
             let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), &self.full_path(), mut_part.entry.chunks.clone()).await?;
             mut_part.entry.chunks = manifest_chunks;
+            log::trace!("{:?} flush: create entry, chunks: {}", self, mut_part.entry.chunks.len());
             self.owner().filer_client().create_entry(&self.full_path().parent().unwrap(), &mut_part.entry).await
                 .map_err(|e| {
+                    log::error!("{:?} flush: create entry failed: {}", self, e);
                     anyhow::anyhow!("create entry failed: {}", e)
                 })?;
             mut_part.dirty = false;
