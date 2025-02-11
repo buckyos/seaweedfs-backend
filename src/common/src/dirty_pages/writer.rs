@@ -1,11 +1,13 @@
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
+use std::fmt;
 use tokio::sync::oneshot;
 
 use super::page::{ChunkPage, WritableChunkPage};
 use super::mem::{MemPage, SealedMemPage};
 
 pub struct PageWriter {
+    id: u64, 
     chunk_size: usize,
     writable_chunk_limit: usize,
 
@@ -18,9 +20,16 @@ pub struct PageWriter {
 
 const MODE_CHANGE_LIMIT: i64 = 3;
 
+impl fmt::Debug for PageWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PageWriter {{ id: {} }}", self.id)
+    }
+}
+
 impl PageWriter {
-    pub fn new(chunk_size: usize, writable_chunk_limit: usize) -> Self {
+    pub fn new(id: u64, chunk_size: usize, writable_chunk_limit: usize) -> Self {
         Self {
+            id,
             chunk_size,
             writable_chunk_limit,
             is_sequential_counter: 0,
@@ -60,10 +69,12 @@ impl PageWriter {
     pub fn post_uploaded(&mut self, chunk_index: i64, ts_ns: u64)  {
         if let Some(page) = self.sealed_chunks.get(&chunk_index) {
             if page.latest_ts_ns() == ts_ns {
+                log::trace!("{:?} post_uploaded: sealed index: {}, ts_ns: {}", self, chunk_index, ts_ns);
                 self.sealed_chunks.remove(&chunk_index);
             }
         }
         if self.sealed_chunks.len() == 0 && self.writable_chunks.len() == 0 {
+            log::trace!("{:?} post_uploaded: all flushed", self);
             for sender in self.flush_waiters.drain(..) {
                 sender.send(()).unwrap();
             }
@@ -139,13 +150,16 @@ impl PageWriter {
     }
 
     pub fn flush(&mut self) -> (Option<Vec<(i64, u64)>>, Option<oneshot::Receiver<()>>) {
+        log::trace!("{:?} flush", self);
         let mut to_upload = BTreeMap::new();
         let mut uploads = vec![];
         std::mem::swap(&mut self.writable_chunks, &mut to_upload);
         for (chunk_index, page) in to_upload {
             uploads.push((chunk_index, page.latest_ts_ns()));
+            log::trace!("{:?} flush: insert sealed chunk: {}", self, chunk_index);
             self.sealed_chunks.insert(chunk_index, SealedMemPage::from(page));
         }
+
         let receiver = self.wait_all_uploaded();
         if uploads.len() > 0 {
             (Some(uploads), receiver)

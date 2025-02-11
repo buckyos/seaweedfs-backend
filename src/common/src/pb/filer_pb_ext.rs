@@ -220,7 +220,7 @@ impl FilerClient {
     pub async fn lookup_directory_entry(&self, path: &Path) -> Result<Option<Entry>> {
         self.with_retry(|mut client| {
             let req = LookupDirectoryEntryRequest {
-                directory: path.to_string_lossy().to_string(),
+                directory: path.parent().unwrap().to_string_lossy().to_string(),
                 name: path.file_name().unwrap().to_string_lossy().to_string(),
             };
             async move {

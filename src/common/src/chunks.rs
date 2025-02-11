@@ -1,5 +1,9 @@
 use anyhow::Result;
+use reqwest::header::CONTENT_DISPOSITION;
+use reqwest::multipart;
 use serde::Deserialize;
+use ureq::http::{HeaderMap, HeaderValue};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashSet;
@@ -306,9 +310,27 @@ pub struct UploadResult {
     pub content_md5: Option<String>,
 }
 
+fn escape_filename(filename: &str) -> Cow<str> {
+    // 如果不包含需要转义的字符，直接返回原字符串
+    if !filename.contains(|c| c == '\\' || c == '"') {
+        return Cow::Borrowed(filename);
+    }
+    
+    // 否则创建新字符串并转义
+    let mut escaped = String::with_capacity(filename.len());
+    for c in filename.chars() {
+        match c {
+            '\\' => escaped.push_str(r"\\"),
+            '"' => escaped.push_str(r#"\""#),
+            _ => escaped.push(c),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
 pub async fn retried_upload_chunk(
     target_url: &str, 
-    file_id: &str, 
+    file_name: &str, 
     content: impl Clone + Into<reqwest::Body>
 ) -> Result<UploadResult> {
     let client = reqwest::Client::builder()
@@ -320,22 +342,21 @@ pub async fn retried_upload_chunk(
     let mut last_err = None;
 
     while wait_time < MAX_WAIT {
-        let body = content.clone().into();
-        // let body = match &content.content {
-        //     SplitPageContent::Mem(content) => {
-        //         let content = unsafe {
-        //             std::mem::transmute::<&[u8], &[u8]>(*content)
-        //         };
-        //         reqwest::Body::from(content)
-        //     }
-        //     SplitPageContent::File(_content) => {
-        //         unimplemented!()
-        //     }
-        // };
+        let form = multipart::Form::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("form-data"));
+        headers.insert("Idempotency-Key", HeaderValue::from_str(target_url).unwrap());
+        let part = multipart::Part::stream(content.clone())
+            .file_name(escape_filename(file_name).to_string())
+            .headers(headers);
+        let part = if let Some(mime) = mime_guess::from_path(file_name).first() {
+            part.mime_str(mime.to_string().as_str()).unwrap()
+        } else {
+            part
+        };
+            
         match client.post(target_url)
-            .header("Content-Disposition", format!("form-data; name=\"file\"; filename=\"{}\"", file_id))
-            .header("Idempotency-Key", target_url)
-            .body(body)
+            .multipart(form.part("file", part))
             .send()
             .await {
                 Ok(resp) => {
@@ -388,7 +409,9 @@ async fn manifestize_chunks(
     merge_factor: usize
 ) -> Result<Vec<FileChunk>> {
     let mut manifest_chunks = Vec::new();
-    for to_merge in chunks.chunks(merge_factor) {
+    let chunk_merge_iter = chunks.chunks_exact(merge_factor);
+    let mut last_chunks = Vec::from(chunk_merge_iter.remainder());
+    for to_merge in chunk_merge_iter {
         let manifest = FileChunkManifest {
             chunks: Vec::from(to_merge),
         };
@@ -411,5 +434,7 @@ async fn manifestize_chunks(
         manifest_chunk.size = (range.end - range.start) as u64;
         manifest_chunks.push(manifest_chunk);
     }
+   
+    manifest_chunks.append(&mut last_chunks);
     Ok(manifest_chunks)
 }

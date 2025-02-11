@@ -52,6 +52,7 @@ impl<T: FileHandleOwner> std::fmt::Debug for FileHandle<T> {
     }
 }
 
+
 impl<T: FileHandleOwner> FileHandle<T> {
     pub fn new(
         owner: T,
@@ -73,7 +74,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 mut_part: RwLock::new(FileHandleMutPart {
                     entry,
                     chunk_group,
-                    page_writer: PageWriter::new(owner.chunk_size_limit(), owner.concurrent_writers()),
+                    page_writer: PageWriter::new(handle_id, owner.chunk_size_limit(), owner.concurrent_writers()),
                     dirty: false,
                 }),
                 owner,
@@ -149,8 +150,14 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 } {
                     let mut chunks = Vec::new();
                     let readers = page.split_readers();
+                    log::trace!("{:?} upload: sealed index: {}, ts_ns: {}", self, chunk_index, ts_ns);
                     for reader in readers {
-                        let chunk = self.owner().upload(full_path.as_path(), &reader.content, reader.offset, reader.ts_ns as i64).await?;
+                        log::trace!("{:?} upload: sealed index: {}, offset: {}, ts_ns: {}", self, chunk_index, reader.offset, reader.ts_ns);
+                        let chunk = self.owner().upload(full_path.as_path(), &reader.content, reader.offset, reader.ts_ns as i64).await
+                            .map_err(|e| {
+                                log::error!("{:?} upload: sealed index: {}, offset: {}, ts_ns: {}, error: {}", self, chunk_index, reader.offset, reader.ts_ns, e);
+                                e
+                            })?;
                         chunks.push(chunk);
                     }
                     Some(chunks)
@@ -203,20 +210,30 @@ impl<T: FileHandleOwner> FileHandle<T> {
         if let Some(uploads) = uploads {
             let fh = self.clone();
             tokio::spawn(async move {
-                let _ = fh.upload(uploads).await;
+                let _ = fh.upload(uploads).await
+                    .map_err(|e| {
+                        log::error!("{:?} flush: upload failed: {}", fh, e);
+                        e
+                    });
             });
         }
 
         if let Some(waiter) = waiter {
+            log::trace!("{:?} flush: wait all uploaded", self);
             let _ = waiter.await;
         }
+
+        log::trace!("{:?} flush: wait all uploaded: ok", self);
 
         let mut mut_part = self.inner.mut_part.write().unwrap();    
 
         if mut_part.dirty {
             let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), &self.full_path(), mut_part.entry.chunks.clone()).await?;
             mut_part.entry.chunks = manifest_chunks;
-            self.owner().filer_client().create_entry(&self.full_path().parent().unwrap(), &mut_part.entry).await?;
+            self.owner().filer_client().create_entry(&self.full_path().parent().unwrap(), &mut_part.entry).await
+                .map_err(|e| {
+                    anyhow::anyhow!("create entry failed: {}", e)
+                })?;
             mut_part.dirty = false;
         }
         

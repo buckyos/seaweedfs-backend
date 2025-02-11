@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dfs_common::{pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *}};
+use dfs_common::pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *};
 use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, future::Future, str::FromStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -13,7 +13,7 @@ use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
 use crate::file::{FileHandle, FileHandleId, FileHandleOwner};
 use crate::path::{InodeToPath, ROOT_INODE};
-use rand::seq::{SliceRandom};
+use rand::seq::SliceRandom;
 use std::thread_local;
 use std::cell::RefCell;
 use tokio::runtime::Runtime;
@@ -335,7 +335,6 @@ impl UploadChunk for Wfs {
         offset: i64,
         ts_ns: i64
     ) -> Result<FileChunk> {
-        let file_id = full_path.file_name().unwrap().to_string_lossy().to_string();
         let assign_volume_req = AssignVolumeRequest {
             count: 1,
             replication: self.option().replication.clone(),
@@ -347,8 +346,15 @@ impl UploadChunk for Wfs {
             data_node: "".to_string(),
             path: full_path.to_string_lossy().to_string(),
         };
-        let assign_volume_resp = self.filer_client().assign_volume(assign_volume_req).await?;
-        let location = assign_volume_resp.location.ok_or_else(|| anyhow::anyhow!("no location found for volume {}", file_id))?;
+        let assign_volume_resp = self.filer_client().assign_volume(assign_volume_req).await
+            .map_err(|e| {
+                anyhow::anyhow!("assign volume failed: {}", e)
+            })?;
+        let file_id = &assign_volume_resp.file_id;
+        let location = assign_volume_resp.location
+            .ok_or_else(|| anyhow::anyhow!("no location found"))?;
+        
+        log::trace!("path: {}, offset {}, ts: {} assign volume: {}", full_path.to_string_lossy(), offset, ts_ns, file_id);
         let upload_url = match self.option().volume_server_access {
             VolumeServerAccess::FilerProxy => {
                 format!("http://{}/?proxyChunkId={}", location.url, file_id)
@@ -362,7 +368,14 @@ impl UploadChunk for Wfs {
         };
 
         // FIXME: auth, gzip and cipher
-        let result = chunks::retried_upload_chunk(&upload_url, &file_id, content).await?;
+        let result = chunks::retried_upload_chunk(
+            &upload_url, 
+            full_path.file_name().unwrap().to_string_lossy().to_string().as_str(), 
+            content
+        ).await
+            .map_err(|e| {
+                anyhow::anyhow!("upload chunk {} failed: {}", file_id, e)
+            })?;
         // TODO: insert to chunk cache
         // if content.offset == 0 {
         //     self.chunk_cache().set(&assign_volume_resp.file_id, Arc::new());
@@ -621,7 +634,7 @@ impl Filesystem for Wfs {
         
 
         match with_thread_local_runtime(
-            self.filer_client().create_entry(entry_full_path.as_path(), &entry)
+            self.filer_client().create_entry(dir_full_path.as_path(), &entry)
         ) {
             Ok(_) => (),
             Err(e) => {
@@ -673,6 +686,7 @@ impl Filesystem for Wfs {
                 reply.opened(id, flags as u32);
             }
             None => {
+                log::trace!("open: ino: {}, entry not found", ino);
                 reply.error(ENOENT);
             }
         }
@@ -715,8 +729,10 @@ impl Filesystem for Wfs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        let fh = self.get_handle_by_id(fh);
-        if fh.is_none() {
+        log::trace!("read: fh: {}, offset: {}, size: {}", fh, offset, size);
+        let file_handle = self.get_handle_by_id(fh);
+        if file_handle.is_none() {
+            log::trace!("read: fh: {} not found", fh);
             reply.error(ENOENT);
             return;
         }
@@ -724,13 +740,15 @@ impl Filesystem for Wfs {
         // TODO: optimize buffer allocation
         let mut buffer = vec![0u8; size as usize];
         
-        let file_handle = fh.unwrap();
+        let file_handle = file_handle.unwrap();
         match file_handle.read(&mut buffer, offset) {
             Ok((n, _ts_ns)) => {
+                log::trace!("read: fh: {}, offset: {}, size: {}, read: {}", fh, offset, size, n);
                 // 只返回实际读取的数据
                 reply.data(&buffer[..n]);
             },
-            Err(_) => {
+            Err(e) => {
+                log::trace!("read: fh: {}, offset: {}, size: {}, error: {}", fh, offset, size, e);
                 reply.error(ENOENT);
             }
         }
@@ -748,18 +766,22 @@ impl Filesystem for Wfs {
         _lock: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let fh = self.get_handle_by_id(fh);
-        if fh.is_none() {
+        log::trace!("write: fh: {}, offset: {}, len: {:?}", fh, offset, data.len());
+        let file_handle = self.get_handle_by_id(fh);
+        if file_handle.is_none() {
+            log::trace!("write: fh: {} not found", fh);
             reply.error(ENOENT);
             return;
         }
 
-        let file_handle = fh.unwrap();
+        let file_handle = file_handle.unwrap();
         match file_handle.write(data, offset) {
             Ok(n) => {
+                log::trace!("write: fh: {}, offset: {}, len: {:?}, written: {}", fh, offset, data.len(), n);
                 reply.written(n as u32);
             }
-            Err(_) => {
+            Err(e) => {
+                log::trace!("write: fh: {}, offset: {}, len: {:?}, error: {}", fh, offset, data.len(), e);
                 reply.error(ENOENT);
             }
         }
@@ -773,18 +795,22 @@ impl Filesystem for Wfs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        let fh = self.get_handle_by_id(fh);
-        if fh.is_none() {
+        log::trace!("flush: fh: {}", fh);
+        let file_handle = self.get_handle_by_id(fh);
+        if file_handle.is_none() {
+            log::trace!("flush: fh: {} not found", fh);
             reply.error(ENOENT);
             return;
         }
 
-        let file_handle = fh.unwrap();
+        let file_handle = file_handle.unwrap();
         match with_thread_local_runtime(file_handle.flush()) {
             Ok(_) => {
+                log::trace!("flush: fh: {} ok", fh);
                 reply.ok();
             }
-            Err(_) => {
+            Err(e) => {
+                log::trace!("flush: fh: {}, error: {}", fh, e);
                 reply.error(ENOENT);
             }
         }
@@ -808,6 +834,7 @@ impl Filesystem for Wfs {
                 );
             }
             None => {
+                log::trace!("getattr: ino: {}, entry not found", ino);
                 reply.error(ENOENT);
             }
         }
@@ -832,13 +859,14 @@ impl Filesystem for Wfs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        log::trace!("setattr: ino: {}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, atime: {:?}, mtime: {:?}", ino, mode, uid, gid, size, atime, mtime);
         match with_thread_local_runtime(
             self.get_entry_by_inode(ino)
         ) {
             Some((mut entry, fh)) => {
                 // TODO: wormEnforced
-                    let mut update_chunks = false;
-                    if let Some(size) = size {
+                let mut update_chunks = false;
+                if let Some(size) = size {
                     update_chunks = entry.truncate(size);
                 }
 
@@ -865,7 +893,8 @@ impl Filesystem for Wfs {
                 if let Some(fh) = fh {
                     match fh.update_entry(entry.clone(), update_chunks) {
                         Ok(_) => (),
-                        Err(_) => {
+                        Err(e) => {
+                            log::trace!("setattr: ino: {}, update entry failed, error: {}", ino, e);
                             reply.error(ENOENT);
                             return;
                         }
@@ -876,7 +905,8 @@ impl Filesystem for Wfs {
                     self.filer_client().update_entry(entry.clone())
                 ) {
                     Ok(_) => (),
-                    Err(_) => {
+                    Err(e) => {
+                        log::trace!("setattr: ino: {}, update entry failed, error: {}", ino, e);
                         reply.error(ENOENT);
                         return;
                     }
@@ -888,6 +918,7 @@ impl Filesystem for Wfs {
                 );
             }
             None => {
+                log::trace!("setattr: ino: {}, entry not found", ino);
                 reply.error(ENOENT);
             }
         }
