@@ -45,6 +45,31 @@ impl InodeToPath {
         self.inode_to_path.get(&inode).and_then(|entry| entry.path.first().map(|p| p.as_path()))
     }
 
+    pub fn move_path(&mut self, old_path: &Path, new_path: &Path) -> (Option<u64>, Option<u64>) {
+        let target_inode = self.path_to_inode.remove(new_path);
+        if let Some(target_inode) = target_inode {
+            self.remove_inode(target_inode);
+        }
+        let source_inode = self.path_to_inode.remove(old_path);
+        if let Some(source_inode) = source_inode {
+            self.path_to_inode.insert(new_path.to_path_buf(), source_inode);
+        } else {
+            return (source_inode, target_inode);
+        }
+        let source_inode = source_inode.unwrap();
+        if let Some(entry) = self.inode_to_path.get_mut(&source_inode) {
+            entry.path.iter_mut().for_each(|p| {
+                if p == old_path {
+                    *p = new_path.to_path_buf();
+                }
+            });
+            if target_inode.is_some() {
+                entry.nlookup += 1;
+            }
+        }
+        (Some(source_inode), target_inode)
+    }
+
     pub fn allocate_inode(&self, path: &Path, ts_ns: u64) -> u64 {
         if path.to_string_lossy() == "/" {
             return ROOT_INODE;
@@ -54,6 +79,21 @@ impl InodeToPath {
             inode += 1;
         }
         inode
+    }
+
+    pub fn remove_path(&mut self, path: &Path) {
+        if let Some(inode) = self.path_to_inode.remove(path) {
+            self.remove_inode(inode);
+        }
+    }
+
+    pub fn remove_inode(&mut self, inode: u64) {
+        if let Some(entry) = self.inode_to_path.get_mut(&inode) {
+            entry.path.clear();
+            if entry.path.is_empty() {
+                self.inode_to_path.remove(&inode);
+            }
+        }
     }
 
     pub fn lookup(

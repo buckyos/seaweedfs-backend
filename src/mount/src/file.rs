@@ -90,6 +90,11 @@ impl<T: FileHandleOwner> FileHandle<T> {
         &self.inner.owner
     }
 
+    pub fn rename(&self, name: String) {
+        let mut mut_part = self.inner.mut_part.write().unwrap();
+        mut_part.entry.name = name;
+    }
+
     pub fn entry(&self) -> Entry {
         let mut_part = self.inner.mut_part.read().unwrap();
         mut_part.entry.clone()

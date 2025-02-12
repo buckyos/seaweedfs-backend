@@ -114,6 +114,14 @@ impl fmt::Display for FilerClient {
 }
 
 impl FilerClient {
+    fn error_not_found() -> &'static str {
+        "filer: no entry is found in filer store"
+    }
+
+    fn no_error() -> &'static str {
+        ""
+    }
+
     pub async fn connect(addresses: Vec<String>) -> Result<Self> {
         let mut clients = Vec::new();
                 
@@ -219,8 +227,75 @@ impl FilerClient {
                 ..Default::default()
             };
             async move {
-                let _ = client.create_entry(req).await?;
-                Ok(())
+                let resp = client.create_entry(req).await?.into_inner();
+                if resp.error == Self::no_error() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("{}", resp.error))
+                }
+            }
+        }).await
+    }
+
+    pub async fn delete_entry(&self, path: &Path) -> Result<()> {
+        self.with_retry(|mut client| {
+            let req = DeleteEntryRequest {
+                directory: path.parent().unwrap().to_string_lossy().to_string(),
+                name: path.file_name().unwrap().to_string_lossy().to_string(),
+                is_delete_data: true,
+                is_recursive: false,
+                ignore_recursive_error: true,
+                is_from_other_cluster: false,
+                signatures: vec![],
+                if_not_modified_after: 0,
+            };
+            async move {
+                let resp = client.delete_entry(req).await?.into_inner();
+                if resp.error == Self::no_error() {
+                    Ok(())
+                } else if resp.error == Self::error_not_found() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("{}", resp.error))
+                }
+            }
+        }).await
+    }
+
+    pub async fn rename_entry(&self, old_path: &Path, new_path: &Path) -> Result<impl Stream<Item = Result<StreamRenameEntryResponse>>> {
+        struct RenameEntryStream(Streaming<StreamRenameEntryResponse>);
+        
+        impl Stream for RenameEntryStream {
+            type Item = Result<StreamRenameEntryResponse>;
+
+            fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                let stream = &mut self.get_mut().0;
+                match Pin::new(stream).poll_next(cx) {
+                    Poll::Ready(Some(Ok(response))) => {
+                        Poll::Ready(Some(Ok(response)))
+                    },
+                    Poll::Ready(Some(Err(e))) => {
+                        Poll::Ready(Some(Err(anyhow::anyhow!("http status: {}", e))))
+                    },
+                    Poll::Ready(None) => {
+                        Poll::Ready(None)
+                    },
+                    _ => Poll::Pending,
+                }
+            }
+        }
+
+        self.with_retry(|mut client| {
+            let req = StreamRenameEntryRequest {
+                old_directory: old_path.parent().unwrap().to_string_lossy().to_string(),
+                old_name: old_path.file_name().unwrap().to_string_lossy().to_string(),
+                new_directory: new_path.parent().unwrap().to_string_lossy().to_string(),
+                new_name: new_path.file_name().unwrap().to_string_lossy().to_string(),
+                signatures: vec![],
+            };
+            async move {
+                let response = client.stream_rename_entry(req).await?;
+                Ok(RenameEntryStream(response.into_inner()))
             }
         }).await
     }

@@ -68,6 +68,7 @@ struct FileChunkSection {
 
 impl FileChunkSection {
     fn new(section_index: SectionIndex, chunks: Vec<FileChunk>) -> Self {
+        // FIXME: should read resolved chunks when read at
         let visibles = chunks::read_resolved_chunks(&chunks, (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64);
         let visables = visibles.iter().map(|visable| &visable.value.file_id).collect::<HashSet<_>>();
         let (compacted, _) = chunks.into_iter().partition(|chunk| visables.contains(&chunk.file_id));
@@ -272,9 +273,10 @@ impl<T: ChunkCache> ChunkGroup<T> {
     ) {
         let mut mut_part = self.mut_part.write().unwrap();
         for chunk in chunks {
-            let section_index = chunk.offset as u64 / SECTION_SIZE;
-            log::trace!("add_chunks: section_index: {}, chunk: {}", section_index, chunk.file_id);
-            mut_part.sections.entry(section_index).or_insert(FileChunkSection::new(section_index, vec![])).add_chunk(chunk);
+            for section_index in chunk.offset as u64 / SECTION_SIZE..(chunk.offset as u64 + chunk.size) / SECTION_SIZE + 1 {
+                log::trace!("add_chunks: section_index: {}, chunk: {}", section_index, chunk.file_id);
+                mut_part.sections.entry(section_index).or_insert(FileChunkSection::new(section_index, vec![])).add_chunk(chunk.clone());
+            }
         }
     }
 
@@ -291,7 +293,6 @@ impl<T: ChunkCache> ChunkGroup<T> {
                 data_chunks.push(chunk);
                 continue;
             }
-
             let mut resolved_chunks = chunks::resolve_chunk_manifest(lookup, &chunk)?;
             data_chunks.append(&mut resolved_chunks);
         }   

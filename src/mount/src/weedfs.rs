@@ -60,6 +60,7 @@ pub struct WfsOption {
     pub dir: PathBuf,
     pub dir_auto_create: bool,
     pub filer_mount_root_path: PathBuf,
+    pub umask: u32,
 
     pub replication: String,
     pub collection: String,
@@ -84,6 +85,7 @@ impl Default for WfsOption {
             collection: "".to_string(),
             disk_type: "".to_string(),
             data_center: "".to_string(),
+            umask: 0o022,
             volume_server_access: VolumeServerAccess::Url,
         }
     }
@@ -418,6 +420,28 @@ impl Wfs {
             }
         }
     }
+
+    async fn rename_entry(&self, old_path: &Path, new_path: &Path) -> Result<()> {
+        let mut stream = self.filer_client().rename_entry(old_path, new_path).await?;
+        while let Some(resp) = stream.next().await {
+            if let Err(e) = resp {
+                return Err(e);
+            }
+            let resp = resp.unwrap();
+            if let Some(new_entry) = resp.event_notification.as_ref().and_then(|e| e.new_entry.as_ref()) {
+                let notification = resp.event_notification.as_ref().unwrap();
+                let old_child = Path::new(&resp.directory).join(&notification.old_entry.as_ref().unwrap().name);
+                let new_child = Path::new(&notification.new_parent_path).join(&new_entry.name);
+                let (source_inode, _) = self.inner.inode_to_path.write().unwrap().move_path(&old_child, &new_child);
+                if let Some(source_inode) = source_inode {
+                    if let Some(fh) = self.get_handle_by_inode(source_inode) {
+                        fh.rename(new_entry.name.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl LookupFileId for Wfs {
@@ -576,6 +600,11 @@ fn chmod(mode: &mut u32, new_mode: u32) {
     *mode = *mode & 0o777 | new_mode & 0o777
 }
 
+const RENAME_FLAG_EMPTY: u32 = 0;
+const RENAME_FLAG_NO_REPLACE: u32 = 1;
+const RENAME_FLAG_EXCHANGE: u32 = 2;
+const RENAME_FLAG_WHITEOUT: u32 = 3;
+
 const OS_MODE_REGULAR: u32 = 0;
 const OS_MODE_DIR: u32 = 1 << (32 - 1); 
 const OS_MODE_APPEND: u32 = 1 << (32 - 2); 
@@ -637,6 +666,244 @@ fn to_unix_time(time: TimeOrNow) -> i64 {
 }
 
 impl Filesystem for Wfs {
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let parent_path = self.get_path(parent);
+        if parent_path.is_none() {
+            log::trace!("symlink: parent not found, parent: {}", parent);
+            reply.error(ENOENT);
+            return;
+        }
+        let parent_path = parent_path.unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let entry = Entry {
+            name: link_name.to_string_lossy().to_string(),
+            is_directory: false,
+            attributes: Some(FuseAttributes {
+                mtime: now as i64,
+                crtime: now as i64,
+                file_mode: OS_MODE_SYMLINK | OS_MODE_PERM,
+                symlink_target: target.to_string_lossy().to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        
+        match with_thread_local_runtime(
+            self.filer_client().create_entry(
+                parent_path.as_path(), 
+                &entry
+            )
+        ) {
+            Ok(_) => {
+            },
+            Err(e) => {
+                log::trace!("symlink: create entry failed, error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        }
+        let entry_full_path = parent_path.join(link_name);
+        let inode = self.inner.inode_to_path.write().unwrap().lookup(
+            entry_full_path.as_path(), 
+            now, 
+            false, 
+            false, 
+            0, 
+            true
+        );
+
+        reply.entry(
+            &self.option().ttl, 
+            &EntryAttr::from((entry, inode, true)).into(), 
+            1
+        );
+    }
+
+
+    fn readlink(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        reply: ReplyData,
+    ) {
+        let full_path = self.get_path(ino);
+        if full_path.is_none() {
+            log::trace!("readlink: ino not found, ino: {}", ino);
+            reply.error(ENOENT);
+            return;
+        }
+        let full_path = full_path.unwrap();
+        let entry = with_thread_local_runtime(self.get_entry_by_path(full_path.as_path()));
+        if entry.is_none() {
+            log::trace!("readlink: entry not found, path: {}", full_path.to_string_lossy());
+            reply.error(ENOENT);
+            return;
+        }
+        let entry = entry.unwrap();
+        if entry.attributes.as_ref().unwrap().file_mode & OS_MODE_SYMLINK == 0 {
+            log::trace!("readlink: entry is not a symlink, path: {}", full_path.to_string_lossy());
+            reply.error(EINVAL);
+            return;
+        }
+        reply.data(entry.attributes.as_ref().unwrap().symlink_target.as_bytes());
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        old_parent: u64,
+        old_name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let old_parent_path = self.get_path(old_parent);
+        if old_parent_path.is_none() {
+            log::trace!("rename: old parent not found, old_parent: {}", old_parent);
+            reply.error(ENOENT);
+            return;
+        }
+        let old_parent_path = old_parent_path.unwrap();
+        let old_full_path = old_parent_path.join(old_name);
+
+        let new_parent_path = self.get_path(new_parent);
+        if new_parent_path.is_none() {
+            log::trace!("rename: new parent not found, new_parent: {}", new_parent);
+            reply.error(ENOENT);
+            return;
+        }
+        let new_parent_path = new_parent_path.unwrap();
+        let new_full_path = new_parent_path.join(new_name);
+
+        if flags >= RENAME_FLAG_WHITEOUT {
+            reply.error(EINVAL);
+            return;
+        }
+      
+        // FIXME: worm 
+        // if wormEnforced, _ := wfs.wormEnforcedForEntry(oldPath, oldEntry); wormEnforced {
+        //     return fuse.EPERM
+        // }
+
+        match with_thread_local_runtime(
+            self.rename_entry(
+                old_full_path.as_path(),
+                new_full_path.as_path()
+            )
+        ) {
+            Ok(_) => {
+                reply.ok();
+            },
+            Err(e) => {
+                log::trace!("rename: rename entry failed, error: {}", e);
+                reply.error(EIO);
+                return; 
+            }
+        }
+    }
+
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let entry = Entry {
+            name: name.to_string_lossy().to_string(),
+            is_directory: true,
+            attributes: Some(FuseAttributes {
+                mtime: now as i64,
+                crtime: now as i64,
+                file_mode: OS_MODE_DIR | (mode & !umask),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let parent_path = self.get_path(parent);
+        if parent_path.is_none() {
+            log::trace!("mkdir: parent not found, parent: {}", parent);
+            reply.error(ENOENT);
+            return;
+        }
+        let parent_path = parent_path.unwrap();
+        
+
+        match with_thread_local_runtime(
+            self.filer_client().create_entry(
+                    parent_path.as_path(), 
+                    &entry
+                )
+            ) {
+            Ok(_) => {
+            },
+            Err(e) => {
+                log::trace!("mkdir: create entry failed, error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        }
+        
+
+        let entry_full_path = parent_path.join(name);
+        let inode = self.inner.inode_to_path.write().unwrap().lookup(
+            entry_full_path.as_path(), 
+            now, 
+            true, 
+            false, 
+            0, 
+            true
+        );
+
+        reply.entry(
+            &self.option().ttl, 
+            &EntryAttr::from((entry, inode, true)).into(), 
+            1
+        );
+    }
+
+    fn rmdir(
+        &mut self, 
+        _req: &Request<'_>, 
+        parent: u64, 
+        name: &OsStr, 
+        reply: ReplyEmpty
+    ) {
+        let parent_path = self.get_path(parent);
+        if parent_path.is_none() {
+            log::trace!("rmdir: parent not found, parent: {}", parent);
+            reply.error(ENOENT);
+            return;
+        }
+        let parent_path = parent_path.unwrap();
+        match with_thread_local_runtime(
+            self.filer_client().delete_entry(&parent_path.join(name))
+        ) {
+            Ok(_) => (),
+            Err(e) => {
+                log::trace!("rmdir: delete entry failed, error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        }
+        let entry_full_path = parent_path.join(name);
+        self.inner.inode_to_path.write().unwrap().remove_path(&entry_full_path.as_path());
+        reply.ok();
+    }
+
     fn opendir(
         &mut self, 
         _req: &Request<'_>, 
