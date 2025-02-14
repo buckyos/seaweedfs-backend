@@ -590,7 +590,7 @@ impl Into<FileAttr> for EntryAttr {
             uid: entry.attributes.as_ref().unwrap().uid,
             gid: entry.attributes.as_ref().unwrap().gid,
             rdev: entry.attributes.as_ref().unwrap().rdev,
-            perm: 0,
+            perm: (entry.attributes.as_ref().unwrap().file_mode & OS_MODE_PERM) as u16,
             flags: 0,
         }
     }
@@ -627,7 +627,7 @@ const OS_MODE_TYPE: u32 = OS_MODE_DIR
                 | OS_MODE_DEVICE 
                 | OS_MODE_CHAR_DEVICE
                 | OS_MODE_IRREGULAR;
-const OS_MODE_PERM: u32 = 0o777;
+const OS_MODE_PERM: u32 = 0o7777;
 
 
 fn to_syscall_type(mode: u32) -> FileType {
@@ -655,7 +655,7 @@ fn to_os_file_type(mode: u32) -> u32 {
 }
 
 fn to_os_file_mode(mode: u32) -> u32 {
-    to_os_file_type(mode) | (mode & 0o7777)
+    to_os_file_type(mode) | (mode & OS_MODE_PERM)
 }
 
 fn to_unix_time(time: TimeOrNow) -> i64 {
@@ -753,6 +753,44 @@ impl Filesystem for Wfs {
             return;
         }
         reply.data(entry.attributes.as_ref().unwrap().symlink_target.as_bytes());
+    }
+
+
+    fn unlink(
+        &mut self, 
+        _req: &Request<'_>, 
+        parent: u64, 
+        name: &OsStr, 
+        reply: ReplyEmpty
+    ) {
+        let parent_path = self.get_path(parent);
+        if parent_path.is_none() {
+            // log::trace!("unlink: parent not found, parent: {}", parent);
+            reply.error(ENOENT);
+            return;
+        }
+        let parent_path = parent_path.unwrap();
+        let entry_full_path = parent_path.join(name);
+        let entry = with_thread_local_runtime(self.get_entry_by_path(entry_full_path.as_path()));
+        if entry.is_none() {
+            // log::trace!("unlink: entry not found, path: {}", entry_full_path.to_string_lossy());
+            reply.error(ENOENT);
+            return;
+        }
+        let is_delete_data = entry.as_ref().unwrap().hard_link_counter <= 1;
+        match with_thread_local_runtime(
+            self.filer_client().delete_entry(entry_full_path.as_path(), is_delete_data)
+        ) {
+            Ok(_) => (),
+            Err(_e) => {
+                // log::trace!("unlink: delete entry failed, error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        self.inner.inode_to_path.write().unwrap().remove_path(&entry_full_path.as_path());
+        reply.ok();
     }
 
     fn rename(
@@ -890,7 +928,7 @@ impl Filesystem for Wfs {
         }
         let parent_path = parent_path.unwrap();
         match with_thread_local_runtime(
-            self.filer_client().delete_entry(&parent_path.join(name))
+            self.filer_client().delete_entry(&parent_path.join(name), true)
         ) {
             Ok(_) => (),
             Err(e) => {
@@ -947,7 +985,7 @@ impl Filesystem for Wfs {
 
     fn readdir(
         &mut self,
-        _req: &Request<'_>,
+        _req: &Request,
         ino: u64,
         fh: u64,
         mut offset: i64,

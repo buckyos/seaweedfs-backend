@@ -237,12 +237,12 @@ impl FilerClient {
         }).await
     }
 
-    pub async fn delete_entry(&self, path: &Path) -> Result<()> {
+    pub async fn delete_entry(&self, path: &Path, is_delete_data: bool) -> Result<()> {
         self.with_retry(|mut client| {
             let req = DeleteEntryRequest {
                 directory: path.parent().unwrap().to_string_lossy().to_string(),
                 name: path.file_name().unwrap().to_string_lossy().to_string(),
-                is_delete_data: true,
+                is_delete_data,
                 is_recursive: false,
                 ignore_recursive_error: true,
                 is_from_other_cluster: false,

@@ -16,10 +16,16 @@ fn main() {
         })
         .init();
     
-    let tmp_dir = std::env::temp_dir();
-    let tmp_dir = tmp_dir.join("weedfs_test");
+    let dir = std::env::args().nth(1).unwrap_or_else(|| "./".to_string());
+    let dir = if std::path::Path::new(&dir).is_relative() {
+        let exe_path = std::env::current_exe().unwrap();
+        let exe_dir = exe_path.parent().unwrap();
+        exe_dir.join(dir)
+    } else {
+        std::path::PathBuf::from(dir)
+    };
 
     let mut option = WfsOption::default();
-    option.dir = tmp_dir.clone();
+    option.dir = dir;
     Wfs::mount(option).unwrap();
 }
