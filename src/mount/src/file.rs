@@ -210,7 +210,11 @@ impl<T: FileHandleOwner> FileHandle<T> {
     pub async fn flush(&self) -> Result<()> {
         let (uploads, waiter) = {
             let mut mut_part = self.inner.mut_part.write().unwrap();
-            mut_part.page_writer.flush()
+            let (uploads, waiter) = mut_part.page_writer.flush();
+            if uploads.is_some() {
+                mut_part.dirty = true;
+            }
+            (uploads, waiter)
         };
         
         if let Some(uploads) = uploads {
@@ -234,7 +238,11 @@ impl<T: FileHandleOwner> FileHandle<T> {
         let mut mut_part = self.inner.mut_part.write().unwrap();    
 
         if mut_part.dirty {
-            let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), &self.full_path(), mut_part.entry.chunks.clone()).await?;
+            let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), &self.full_path(), mut_part.entry.chunks.clone()).await
+                .map_err(|e| {
+                    log::error!("{:?} flush: compact chunks failed: {}", self, e);
+                    anyhow::anyhow!("compact chunks failed: {}", e)
+                })?;
             mut_part.entry.chunks = manifest_chunks;
             log::trace!("{:?} flush: create entry, chunks: {}", self, mut_part.entry.chunks.len());
             self.owner().filer_client().create_entry(&self.full_path().parent().unwrap(), &mut_part.entry).await

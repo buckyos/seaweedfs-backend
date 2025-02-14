@@ -21,12 +21,12 @@ pub trait EntryExt {
 impl EntryExt for Entry {
     fn file_size(&self) -> u64 {
         let attributes = self.attributes.as_ref().unwrap();
-        let mut file_size = attributes.file_size;
-        if let Some(remote_entry) = &self.remote_entry {
-            if remote_entry.remote_mtime > attributes.mtime {
-                file_size = max(file_size, remote_entry.remote_size as u64);
-            }
-        }
+        let file_size = attributes.file_size;
+        // if let Some(remote_entry) = &self.remote_entry {
+        //     if remote_entry.remote_mtime > attributes.mtime {
+        //         file_size = max(file_size, remote_entry.remote_size as u64);
+        //     }
+        // }
         max(chunks::total_size(&self.chunks), file_size)
     }
 
@@ -320,18 +320,15 @@ impl FilerClient {
             };
             async move {
                 let response = client.lookup_directory_entry(req).await?;
-                Ok(response.into_inner().entry.map(|mut entry| {
-                    entry.name = path.to_string_lossy().to_string();
-                    entry
-                }))
+                Ok(response.into_inner().entry)
             }
         }).await
     }
 
-    pub async fn update_entry(&self, entry: Entry) -> Result<()> {
+    pub async fn update_entry(&self, parent_dir: &Path, entry: Entry) -> Result<()> {
         self.with_retry(|mut client| {
             let req = UpdateEntryRequest {
-                directory: Path::new(&entry.name).parent().unwrap().to_string_lossy().to_string(),
+                directory: parent_dir.to_string_lossy().to_string(),
                 entry: Some(entry.clone()),
                 is_from_other_cluster: false,
                 signatures: vec![],

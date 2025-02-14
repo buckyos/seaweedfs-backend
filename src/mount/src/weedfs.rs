@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
 };
 use libc::{ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
@@ -61,6 +61,7 @@ pub struct WfsOption {
     pub dir_auto_create: bool,
     pub filer_mount_root_path: PathBuf,
     pub umask: u32,
+    pub allow_others: bool,
 
     pub replication: String,
     pub collection: String,
@@ -86,6 +87,7 @@ impl Default for WfsOption {
             disk_type: "".to_string(),
             data_center: "".to_string(),
             umask: 0o022,
+            allow_others: false,
             volume_server_access: VolumeServerAccess::Url,
         }
     }
@@ -149,12 +151,18 @@ impl Wfs {
     pub fn mount(option: WfsOption) -> Result<()> {
         log::info!("Mounting Wfs with option: {:?}", option);
         let path = option.dir.clone(); 
+       
+        let mut options = vec![MountOption::AutoUnmount];
+        if option.allow_others {
+            options.push(MountOption::AllowOther);
+        }
         let wfs = with_thread_local_runtime(Self::new(option))
-            .map_err(|e| {
-                log::error!("Failed to mount Wfs: {}", e);
-                e
-            })?;
-        fuser::mount2(wfs, &path, &[])
+        .map_err(|e| {
+            log::error!("Failed to mount Wfs: {}", e);
+            e
+        })?;
+
+        fuser::mount2(wfs, &path, &options)
             .map_err(|e| {
                 log::error!("Failed to mount Wfs: {}", e);
                 e
@@ -239,9 +247,9 @@ impl Wfs {
         self.inner.inode_to_path.read().unwrap().has_inode(inode)
     }        
 
-    async fn get_entry_by_inode(&self, inode: u64) -> Option<(Entry, Option<FileHandle<Self>>)> {
+    async fn get_entry_by_inode(&self, inode: u64) -> Option<(PathBuf, Entry, Option<FileHandle<Self>>)> {
         if inode == ROOT_INODE {
-            return Some((Entry {
+            return Some((PathBuf::from("/"), Entry {
                 name: "".to_string(),
                 is_directory: true,
                 attributes: Some(FuseAttributes {
@@ -255,14 +263,15 @@ impl Wfs {
                 ..Default::default()
             }, None));
         }
+        let path = self.get_path(inode);
+        if path.is_none() {
+            return None;
+        }
+        let path = path.unwrap();
         if let Some(fh) = self.get_handle_by_inode(inode) {
-            Some((fh.entry(), Some(fh)))
+            Some((path.parent().unwrap().to_path_buf(), fh.entry(), Some(fh)))
         } else {
-            if let Some(path) = self.get_path(inode) {
-                self.get_entry_by_path(path.as_path()).await.map(|entry| (entry, None))
-            } else {
-                None
-            }
+            self.get_entry_by_path(path.as_path()).await.map(|entry| (path.parent().unwrap().to_path_buf(), entry, None))
         }
     }
 
@@ -282,6 +291,7 @@ impl Wfs {
                ..Default::default()
             });
         } 
+
         self.filer_client().lookup_directory_entry(path).await.ok().and_then(|entry| entry)
     }
 
@@ -597,7 +607,7 @@ impl Into<FileAttr> for EntryAttr {
 }
 
 fn chmod(mode: &mut u32, new_mode: u32) {
-    *mode = *mode & 0o777 | new_mode & 0o777
+    *mode = *mode & !OS_MODE_PERM | new_mode & OS_MODE_PERM
 }
 
 const RENAME_FLAG_EMPTY: u32 = 0;
@@ -765,7 +775,7 @@ impl Filesystem for Wfs {
     ) {
         let parent_path = self.get_path(parent);
         if parent_path.is_none() {
-            // log::trace!("unlink: parent not found, parent: {}", parent);
+            log::trace!("unlink: parent not found, parent: {}", parent);
             reply.error(ENOENT);
             return;
         }
@@ -773,7 +783,7 @@ impl Filesystem for Wfs {
         let entry_full_path = parent_path.join(name);
         let entry = with_thread_local_runtime(self.get_entry_by_path(entry_full_path.as_path()));
         if entry.is_none() {
-            // log::trace!("unlink: entry not found, path: {}", entry_full_path.to_string_lossy());
+            log::trace!("unlink: entry not found, path: {}", entry_full_path.to_string_lossy());
             reply.error(ENOENT);
             return;
         }
@@ -782,8 +792,8 @@ impl Filesystem for Wfs {
             self.filer_client().delete_entry(entry_full_path.as_path(), is_delete_data)
         ) {
             Ok(_) => (),
-            Err(_e) => {
-                // log::trace!("unlink: delete entry failed, error: {}", e);
+            Err(e) => {
+                log::trace!("unlink: delete entry failed, error: {}", e);
                 reply.error(EIO);
                 return;
             }
@@ -851,7 +861,7 @@ impl Filesystem for Wfs {
 
     fn mkdir(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -866,6 +876,8 @@ impl Filesystem for Wfs {
                 mtime: now as i64,
                 crtime: now as i64,
                 file_mode: OS_MODE_DIR | (mode & !umask),
+                uid: req.uid(),
+                gid: req.gid(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1125,7 +1137,7 @@ impl Filesystem for Wfs {
 
     fn mknod(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -1153,8 +1165,8 @@ impl Filesystem for Wfs {
                 mtime: now as i64,
                 crtime: now as i64,
                 file_mode: to_os_file_mode(mode),
-                uid: 0,
-                gid: 0,
+                uid: req.uid(),
+                gid: req.gid(),
                 ttl_sec: self.option().ttl.as_secs() as i32,
                 rdev: rdev,
                 inode: inode,
@@ -1203,7 +1215,7 @@ impl Filesystem for Wfs {
         match with_thread_local_runtime(
             self.get_entry_by_inode(ino)
         ) {
-            Some((entry, _)) => {
+            Some((_, entry, _)) => {
                 let mut fh_map = self.inner.fh_map.write().unwrap();
                 let id = if let Some(id) = fh_map.inode_to_fh.get(&ino).map(|fh| fh.id()) {
                     *fh_map.ref_count.get_mut(&id).unwrap() += 1;
@@ -1361,7 +1373,7 @@ impl Filesystem for Wfs {
         match with_thread_local_runtime(
             self.get_entry_by_inode(ino)
         ) {
-            Some((entry, _)) => {
+            Some((_, entry, _)) => {
                 reply.attr(
                     &self.option().ttl,
                     &EntryAttr::from((entry, ino, true)).into()
@@ -1397,11 +1409,14 @@ impl Filesystem for Wfs {
         match with_thread_local_runtime(
             self.get_entry_by_inode(ino)
         ) {
-            Some((mut entry, fh)) => {
+            Some((parent, mut entry, fh)) => {
+                log::trace!("setattr: ino: {}, entry: {{ name: {}, is_directory: {} }}", ino, entry.name, entry.is_directory);
                 // TODO: wormEnforced
                 let mut update_chunks = false;
                 if let Some(size) = size {
                     update_chunks = entry.truncate(size);
+                    entry.attributes.as_mut().unwrap().mtime = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+                    entry.attributes.as_mut().unwrap().file_size = size;
                 }
 
                 if let Some(mode) = mode {
@@ -1436,7 +1451,7 @@ impl Filesystem for Wfs {
                 }
 
                 match with_thread_local_runtime(
-                    self.filer_client().update_entry(entry.clone())
+                    self.filer_client().update_entry(&parent, entry.clone())
                 ) {
                     Ok(_) => (),
                     Err(e) => {

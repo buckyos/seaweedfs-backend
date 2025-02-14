@@ -27,5 +27,6 @@ fn main() {
 
     let mut option = WfsOption::default();
     option.dir = dir;
+    option.allow_others = true;
     Wfs::mount(option).unwrap();
 }

@@ -131,9 +131,9 @@ impl InodeToPath {
             }
         } else {
             if !is_lookup {
-                self.inode_to_path.insert(exists_inode, InodeEntry { path: vec![path.to_path_buf()], nlookup: 0, is_directory: is_directory });
+                self.inode_to_path.insert(exists_inode, InodeEntry { path: vec![path.to_path_buf()], nlookup: 0, is_directory });
             } else {
-                self.inode_to_path.insert(exists_inode, InodeEntry { path: vec![path.to_path_buf()], nlookup: 1, is_directory: is_directory });
+                self.inode_to_path.insert(exists_inode, InodeEntry { path: vec![path.to_path_buf()], nlookup: 1, is_directory });
             }
         }
 
