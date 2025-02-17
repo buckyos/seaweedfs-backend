@@ -159,7 +159,7 @@ impl Wfs {
         log::info!("Mounting Wfs with option: {:?}", option);
         let path = option.dir.clone(); 
        
-        let mut options = vec![MountOption::AutoUnmount];
+        let mut options = vec![MountOption::AutoUnmount, MountOption::DefaultPermissions];
         if option.allow_others {
             options.push(MountOption::AllowOther);
         }
