@@ -137,12 +137,19 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 let total_read = mut_part.entry.content.len() - offset as usize;
                 (total_read, 0)
             } else {
-                mut_part.chunk_group.read_at(self.owner(), file_size, buff, offset as u64)?
+                mut_part.chunk_group.read_at(self.owner(), file_size, buff, offset as u64)
+                    .map_err(|e| {
+                        log::error!("{:?} read: read from chunk group failed: {}", self, e);
+                        e
+                    })?
             }
         };
 
-        let max_stop = mut_part.page_writer.read(buff, offset, ts_ns);
-        let read = max(read, (max_stop as i64 - offset) as usize);
+        let read = if let Some(max_stop) = mut_part.page_writer.read(buff, offset, ts_ns) {
+            max(read, (max_stop as i64 - offset) as usize)
+        } else {
+            read
+        };
         Ok((read as usize, ts_ns))
     }
 

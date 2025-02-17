@@ -70,28 +70,26 @@ impl FileChunkSection {
     fn new(section_index: SectionIndex, chunks: Vec<FileChunk>) -> Self {
         log::trace!("new: section_index: {}, chunks: {:?}", section_index, chunks);
         // FIXME: should read resolved chunks when read at
-        let visibles = chunks::read_resolved_chunks(&chunks, (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64);
+        let section_range = (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64;
+        let visibles = chunks::read_resolved_chunks(&chunks, section_range.clone());
         log::trace!("new: section_index: {}, visibles: {:?}", section_index, visibles);
         let visables = visibles.iter().map(|visable| &visable.value.file_id).collect::<HashSet<_>>();
         let (compacted, _) = chunks.into_iter().partition(|chunk| visables.contains(&chunk.file_id));
-        let chunk_views = visibles.iter().filter_map(|visable| {
-            if visable.value.offset_in_chunk >= (section_index * SECTION_SIZE) as i64 && visable.value.offset_in_chunk < ((section_index + 1) * SECTION_SIZE) as i64 {
-                let view = Interval {
-                    ts_ns: visable.ts_ns,
-                    value: ChunkView {
-                        file_id: visable.value.file_id.clone(),
-                        offset_in_chunk: visable.value.offset_in_chunk - (section_index * SECTION_SIZE) as i64,
-                        chunk_size: visable.value.chunk_size,
-                        view_size: visable.value.chunk_size,
-                        view_offset: visable.value.offset_in_chunk,
-                    },
-                    range: visable.value.offset_in_chunk..visable.value.offset_in_chunk + visable.value.chunk_size as i64,
-                };
-                log::trace!("new: section_index: {}, chunk_view: {:?}", section_index, view);
-                Some(view)
-            } else {
-                None
-            }
+        let chunk_views = visibles.iter().map(|visable| {
+            let view_range = max(section_range.start, visable.range.start)..min(section_range.end, visable.range.end);
+            let view = Interval {
+                ts_ns: visable.ts_ns,
+                value: ChunkView {
+                    file_id: visable.value.file_id.clone(),
+                    offset_in_chunk: visable.range.start - view_range.start + visable.value.offset_in_chunk,
+                    chunk_size: visable.value.chunk_size,
+                    view_size: (view_range.end - view_range.start) as u64,
+                    view_offset: view_range.start,
+                },
+                range: view_range,
+            };
+            log::trace!("new: section_index: {}, chunk_view: {:?}", section_index, view);
+            view
         }).collect();
         
         Self {
@@ -241,6 +239,7 @@ impl FileChunkSection {
 
         if remaining > 0 {
             let delta = min(remaining as usize, (file_size - start as u64) as usize);
+            log::trace!("read_at: section: {:?}, remaining: {}, delta: {}", self, remaining, delta);
             buf[(start - offset) as usize..(start - offset) as usize + delta].fill(0);
             read += delta;
         }
@@ -343,7 +342,10 @@ impl<T: ChunkCache> ChunkGroup<T> {
                     &self.reader_cache, 
                     &mut buf[(read_range.start - offset) as usize..(read_range.end - offset) as usize], 
                     read_range.start as i64
-                )?;
+                ).map_err(|e| {
+                    log::trace!("read_at: section: {:?}, error: {}", section, e);
+                    e
+                })?;
                 read += n;
                 ts_ns = max(ts_ns, ns);
             } else {

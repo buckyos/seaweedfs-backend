@@ -128,19 +128,22 @@ impl PageWriter {
         uploads
     }
 
-    pub fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> u64 {
-        let mut chunk_index = offset / self.chunk_size as i64;
+    pub fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> Option<u64> {
+        if self.sealed_chunks.len() == 0 && self.writable_chunks.len() == 0 {
+            return None;
+        }
 
+        let mut chunk_index = offset / self.chunk_size as i64;
         let mut remaining_data = &mut data[..];
         let mut offset = offset;
-        let mut max_stop = 0;
+        let mut max_stop = None;
         while remaining_data.len() > 0 {
             let read_size = min(remaining_data.len(), ((chunk_index + 1) * self.chunk_size as i64 - offset) as usize);
             if let Some(page) = self.sealed_chunks.get(&chunk_index) {
-                max_stop = max(max_stop, page.read(&mut remaining_data[..read_size], offset, ts_ns));
+                max_stop = Some(max(max_stop.unwrap_or_default(), page.read(&mut remaining_data[..read_size], offset, ts_ns)));
             } 
             if let Some(page) = self.writable_chunks.get(&chunk_index) {
-                max_stop = max(max_stop, page.read(&mut remaining_data[..read_size], offset, ts_ns));
+                max_stop = Some(max(max_stop.unwrap_or_default(), page.read(&mut remaining_data[..read_size], offset, ts_ns)));
             }
             remaining_data = &mut remaining_data[read_size..];
             offset += read_size as i64;

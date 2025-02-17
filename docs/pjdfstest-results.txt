@@ -13,6 +13,4 @@ rust implementation:
 
 /opt/pjdfstest/tests/open/00.t (Wstat: 0 Tests: 47 Failed: 2)
   Failed tests:  33-34
-/opt/pjdfstest/tests/open/25.t (Wstat: 0 Tests: 6 Failed: 3)
-  Failed tests:  4-6
 

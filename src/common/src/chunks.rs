@@ -156,6 +156,23 @@ fn test_interval_merging() {
                 (50..300, "xxxx", 0),
             ],
         ),
+
+        // case 4
+        (
+            vec![
+                FileChunk {
+                    file_id: "abc".to_string(),
+                    offset: 100,
+                    size: 1, 
+                    modified_ts_ns: 123,
+                    ..Default::default()
+                },
+            ],
+            vec![
+                (100..101, "abc", 0),
+            ],
+        )
+       
     ];
 
     for (i, (chunks, expected)) in test_cases.iter().enumerate() {
@@ -244,24 +261,25 @@ pub fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> Interva
     for point in &points {
         if point.is_start {
             if let Some(prev_point) = queue.last() {
-                if point.x != prev_x && prev_point.ts < point.ts {
-                    let chunk = prev_point.chunk;
-                    visible_intervals.push_back(Interval {
-                        range: prev_x..point.x,
-                        ts_ns: chunk.modified_ts_ns,
-                        value: VisibleInterval {
-                            file_id: chunk.file_id.to_string(),
-                            offset_in_chunk: prev_x - chunk.offset,
-                            chunk_size: chunk.size,
-                        },
-                    });
+                if prev_point.ts < point.ts {
+                    if point.x != prev_x {
+                        if prev_x < point.x {
+                            let chunk = prev_point.chunk;
+                            visible_intervals.push_back(Interval {
+                                range: prev_x..point.x,
+                                ts_ns: chunk.modified_ts_ns,
+                                value: VisibleInterval {
+                                    file_id: chunk.file_id.to_string(),
+                                    offset_in_chunk: prev_x - chunk.offset,
+                                    chunk_size: chunk.size,
+                                    },
+                                });
+                        }
+                    }
                     prev_x = point.x;
-                    continue;
-                } else if prev_point.ts < point.ts {
-                    queue.push(point.clone());
-                    prev_x = point.x;
-                    continue;
-                }
+                } 
+            } else {
+                prev_x = point.x;
             }
 
             // 找到合适的插入位置
@@ -273,7 +291,7 @@ pub fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> Interva
             if let Some(pos) = queue.iter().position(|p| p.ts == point.ts) {
                 let removed_point = queue.remove(pos);
                 // 如果队列为空或者移除的是最新的点，需要添加一个区间
-                if queue.is_empty() || removed_point.ts > queue.last().unwrap().ts {
+                if pos == queue.len() {
                     if prev_x < point.x {
                         visible_intervals.push_back(Interval {
                             range: prev_x..point.x,
@@ -285,8 +303,8 @@ pub fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> Interva
                             },
                         });
                     }
+                    prev_x = point.x;
                 }
-                prev_x = point.x;
             }
         }
     }
@@ -415,7 +433,7 @@ pub fn retried_fetch_chunk_data(
 
     while wait_time < MAX_WAIT {
         for url in &url_strings {
-            log::trace!("retried_fetch_chunk_data: url: {}", url);
+            log::trace!("retried_fetch_chunk_data: url: {} offset: {}, size: {}", url, offset, size);
             let mut req = agent.get(url);
 
             if !is_full_chunk {
@@ -433,6 +451,7 @@ pub fn retried_fetch_chunk_data(
                     }
 
                     let n = std::io::copy(&mut resp.into_body().as_reader(), &mut writer)?;
+                    log::trace!("retried_fetch_chunk_data: url: {} offset: {}, size: {}, n: {}", url, offset, size, n);
                     return Ok(n as usize);
                 }
                 Err(e) => {
