@@ -31,7 +31,7 @@ pub trait UploadChunk {
 }
 
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VisibleInterval {
     pub file_id: String,
     pub offset_in_chunk: i64,
@@ -45,32 +45,156 @@ impl IntervalValue for VisibleInterval {
 }
 
 #[test]
-fn test_read_resolved_chunks() {
-    let chunks = vec![
-        FileChunk {
-            file_id: "file1".to_string(),
-            offset: 0,
-            size: 13,
-            modified_ts_ns: 1000,
-            is_chunk_manifest: false,
-            ..Default::default()
-        },
+fn test_interval_merging() {
+    let test_cases = vec![
+        // case 0: normal
+        (
+            vec![
+                FileChunk {
+                    file_id: "abc".to_string(),
+                    offset: 0,
+                    size: 100,
+                    modified_ts_ns: 123,
+                    ..Default::default()
+                },
+                FileChunk {
+                    file_id: "asdf".to_string(),
+                    offset: 100,
+                    size: 100,
+                    modified_ts_ns: 134,
+                    ..Default::default()
+                },
+                FileChunk {
+                    file_id: "fsad".to_string(),
+                    offset: 200,
+                    size: 100,
+                    modified_ts_ns: 353,
+                    ..Default::default()
+                },
+            ],
+            vec![
+                (0..100, "abc", 0),   // (range, file_id, offset_in_chunk)
+                (100..200, "asdf", 0),
+                (200..300, "fsad", 0),
+            ],
+        ),
+        
+        // case 1: updates overwrite full chunks
+        (
+            vec![
+                FileChunk {
+                    file_id: "abc".to_string(),
+                    offset: 0,
+                    size: 100,
+                    modified_ts_ns: 123,
+                    ..Default::default()
+                },
+                FileChunk {
+                    file_id: "asdf".to_string(),
+                    offset: 0,
+                    size: 200,
+                    modified_ts_ns: 134,
+                    ..Default::default()
+                },
+            ],
+            vec![
+                (0..200, "asdf", 0),
+            ],
+        ),
+        
+        // case 2: updates overwrite part of previous chunks
+        (
+            vec![
+                FileChunk {
+                    file_id: "a".to_string(),
+                    offset: 0,
+                    size: 100,
+                    modified_ts_ns: 123,
+                    ..Default::default()
+                },
+                FileChunk {
+                    file_id: "b".to_string(),
+                    offset: 0,
+                    size: 70,
+                    modified_ts_ns: 134,
+                    ..Default::default()
+                },
+            ],
+            vec![
+                (0..70, "b", 0),
+                (70..100, "a", 70),
+            ],
+        ),
+        
+        // case 3: updates overwrite full chunks
+        (
+            vec![
+                FileChunk {
+                    file_id: "abc".to_string(),
+                    offset: 0,
+                    size: 100,
+                    modified_ts_ns: 123,
+                    ..Default::default()
+                },
+                FileChunk {
+                    file_id: "asdf".to_string(),
+                    offset: 0,
+                    size: 200,
+                    modified_ts_ns: 134,
+                    ..Default::default()
+                },
+                FileChunk {
+                    file_id: "xxxx".to_string(),
+                    offset: 50,
+                    size: 250,
+                    modified_ts_ns: 154,
+                    ..Default::default()
+                },
+            ],
+            vec![
+                (0..50, "asdf", 0),
+                (50..300, "xxxx", 0),
+            ],
+        ),
     ];
-    let visibles = read_resolved_chunks(&chunks, 0..i64::MAX);
-    let intervals: Vec<_> = visibles.into_iter().collect();
-    
-    // 验证区间数量
-    assert_eq!(intervals.len(), 1);
-    
-    // 验证区间内容
-    let interval = &intervals[0];
-    assert_eq!(interval.range, 0..13);
-    assert_eq!(interval.ts_ns, 1000);
-    assert_eq!(interval.value.file_id, "file1");
-    assert_eq!(interval.value.offset_in_chunk, 0);
-    assert_eq!(interval.value.chunk_size, 13);
-}
 
+    for (i, (chunks, expected)) in test_cases.iter().enumerate() {
+        let visibles = read_resolved_chunks(chunks, 0..i64::MAX);
+        let intervals: Vec<_> = visibles.into_iter().collect();
+
+        assert_eq!(
+            intervals.len(),
+            expected.len(),
+            "case {}: wrong number of intervals",
+            i
+        );
+
+        for (j, ((range, file_id, offset_in_chunk), interval)) in 
+            expected.iter().zip(intervals.iter()).enumerate() {
+            assert_eq!(
+                interval.range,
+                *range,
+                "case {}, interval {}: wrong range",
+                i,
+                j
+            );
+            assert_eq!(
+                interval.value.file_id,
+                *file_id,
+                "case {}, interval {}: wrong file_id",
+                i,
+                j
+            );
+            assert_eq!(
+                interval.value.offset_in_chunk,
+                *offset_in_chunk,
+                "case {}, interval {}: wrong offset_in_chunk",
+                i,
+                j
+            );
+        }
+    }
+}
 
 pub fn read_resolved_chunks(chunks: &[FileChunk], _range: Range<i64>) -> IntervalList<VisibleInterval> {
     #[derive(Clone)]

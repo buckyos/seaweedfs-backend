@@ -86,9 +86,8 @@ impl ChunkPage for SealedMemPage {
 
 impl SealedChunkPage for SealedMemPage {
     fn split_readers(&self) -> impl Iterator<Item = SplitChunkPage> {
-        // FIXME: this is not correct, we need to split the data by the usage interval
         self.0.usage.iter().map(|interval| SplitChunkPage {
-            offset: interval.range.start,
+            offset: self.0.chunk_index * self.0.data.len() as i64 + interval.range.start,
             ts_ns: interval.ts_ns as u64,
             content: SplitPageContent::Mem(&self.0.data[interval.range.start as usize..interval.range.end as usize]),
         })

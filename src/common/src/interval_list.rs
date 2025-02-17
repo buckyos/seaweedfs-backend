@@ -1,7 +1,8 @@
 use std::collections::LinkedList;
 use std::ops::Range;
+use std::fmt::Debug;
 
-pub trait IntervalValue: Clone {
+pub trait IntervalValue: Clone + Debug {
     fn set_range(&mut self, old_range: Range<i64>, new_range: Range<i64>);
 }
 
@@ -11,13 +12,14 @@ impl IntervalValue for () {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Interval<T: IntervalValue> {
     pub range: Range<i64>,
     pub ts_ns: i64,
     pub value: T,
 }
 
+#[derive(Clone, Debug)]
 pub struct IntervalList<T: IntervalValue> {
     inner: LinkedList<Interval<T>>,
 }
@@ -123,6 +125,7 @@ impl<T: IntervalValue> IntervalList<T> {
                 continue;
             }
 
+            // 时间戳更新的区间优先
             if current_interval.ts_ns >= current.ts_ns {
                 if current.range.start < current_interval.range.start {
                     let mut left = current.clone();
@@ -131,13 +134,20 @@ impl<T: IntervalValue> IntervalList<T> {
                     left.value.set_range(old_range, left.range.clone());
                     new_list.push_back(left);
                 }
+                
+                // 添加当前区间
+                new_list.push_back(current_interval.clone());
+                
                 if current_interval.range.end < current.range.end {
-                    let new_range = current_interval.range.end..current.range.end;
-                    let old_range = current.range.clone();
-                    current_interval.range = new_range.clone();
-                    current_interval.value.set_range(old_range, new_range);
-                    break;
+                    let mut right = current.clone();
+                    let old_range = right.range.clone();
+                    right.range = current_interval.range.end..current.range.end;
+                    right.value.set_range(old_range, right.range.clone());
+                    new_list.push_back(right);
                 }
+                new_list.append(&mut rest);
+                self.inner = new_list;
+                return;
             } else {
                 if current_interval.range.start < current.range.start {
                     let mut left = current_interval.clone();
@@ -146,12 +156,10 @@ impl<T: IntervalValue> IntervalList<T> {
                     left.value.set_range(old_range, left.range.clone());
                     new_list.push_back(left);
                 }
-                new_list.push_back(current.clone());
-                if current.range.end < current_interval.range.end {
-                    let new_range = current.range.end..current_interval.range.end;
-                    let old_range = current_interval.range.clone();
-                    current_interval.range = new_range.clone();
-                    current_interval.value.set_range(old_range, new_range);
+                let current_end = current.range.end;  // 先保存 end 值
+                new_list.push_back(current);
+                if current_end < current_interval.range.end {
+                    current_interval.range = current_end..current_interval.range.end;
                     continue;
                 }
                 self.inner = new_list;
@@ -170,5 +178,160 @@ impl<T: IntervalValue> IntervalList<T> {
 
     pub fn iter_mut(&mut self) -> std::collections::linked_list::IterMut<'_, Interval<T>> {
         self.inner.iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct IntervalInt(i32);
+
+    impl IntervalValue for IntervalInt {
+        fn set_range(&mut self, _old_range: Range<i64>, _new_range: Range<i64>) {}
+    }
+
+    #[test]
+    fn test_overlay() {
+        let mut list = IntervalList::new();
+        list.overlay(Interval { range: 0..100, ts_ns: 1, value: IntervalInt(1) });
+        list.overlay(Interval { range: 50..150, ts_ns: 2, value: IntervalInt(2) });
+        list.overlay(Interval { range: 200..250, ts_ns: 3, value: IntervalInt(3) });
+        list.overlay(Interval { range: 225..250, ts_ns: 4, value: IntervalInt(4) });
+        list.overlay(Interval { range: 175..210, ts_ns: 5, value: IntervalInt(5) });
+        list.overlay(Interval { range: 0..25, ts_ns: 6, value: IntervalInt(6) });
+        
+        assert_eq!(list.len(), 6);
+
+        list.overlay(Interval { range: 50..150, ts_ns: 7, value: IntervalInt(7) });
+        assert_eq!(list.len(), 6);
+    }
+
+    #[test]
+    fn test_overlay_2() {
+        let mut list = IntervalList::new();
+        list.overlay(Interval { range: 50..100, ts_ns: 1, value: IntervalInt(1) });
+        list.overlay(Interval { range: 0..50, ts_ns: 2, value: IntervalInt(2) });
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_overlay_3() {
+        let mut list = IntervalList::new();
+        list.overlay(Interval { range: 50..100, ts_ns: 1, value: IntervalInt(1) });
+        assert_eq!(list.len(), 1);
+
+        list.overlay(Interval { range: 0..60, ts_ns: 2, value: IntervalInt(2) });
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_overlay_4() {
+        let mut list = IntervalList::new();
+        list.overlay(Interval { range: 50..100, ts_ns: 1, value: IntervalInt(1) });
+        list.overlay(Interval { range: 0..100, ts_ns: 2, value: IntervalInt(2) });
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn test_overlay_5() {
+        let mut list = IntervalList::new();
+        list.overlay(Interval { range: 50..100, ts_ns: 1, value: IntervalInt(1) });
+        list.overlay(Interval { range: 0..110, ts_ns: 2, value: IntervalInt(2) });
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn test_insert_interval_1() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 50..150, ts_ns: 2, value: IntervalInt(2) });
+        list.insert(Interval { range: 200..250, ts_ns: 3, value: IntervalInt(3) });
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_interval_2() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 50..150, ts_ns: 2, value: IntervalInt(2) });
+        list.insert(Interval { range: 0..25, ts_ns: 3, value: IntervalInt(3) });
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_interval_3() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 50..150, ts_ns: 2, value: IntervalInt(2) });
+        list.insert(Interval { range: 200..250, ts_ns: 4, value: IntervalInt(4) });
+        list.insert(Interval { range: 0..75, ts_ns: 3, value: IntervalInt(3) });
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn test_insert_interval_4() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 200..250, ts_ns: 4, value: IntervalInt(4) });
+        list.insert(Interval { range: 0..225, ts_ns: 3, value: IntervalInt(3) });
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_interval_6() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 50..150, ts_ns: 2, value: IntervalInt(2) });
+        list.insert(Interval { range: 200..250, ts_ns: 4, value: IntervalInt(4) });
+        list.insert(Interval { range: 0..275, ts_ns: 1, value: IntervalInt(1) });
+        assert_eq!(list.len(), 5);
+    }
+
+    #[test]
+    fn test_insert_interval_10() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 50..100, ts_ns: 2, value: IntervalInt(2) });
+        list.insert(Interval { range: 200..300, ts_ns: 4, value: IntervalInt(4) });
+        list.insert(Interval { range: 100..200, ts_ns: 5, value: IntervalInt(5) });
+        assert_eq!(list.len(), 3);
+    }
+
+    #[test]
+    fn test_insert_interval_11() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 0..64, ts_ns: 1, value: IntervalInt(1) });
+        list.insert(Interval { range: 72..136, ts_ns: 3, value: IntervalInt(3) });
+        list.insert(Interval { range: 64..128, ts_ns: 2, value: IntervalInt(2) });
+        list.insert(Interval { range: 68..72, ts_ns: 4, value: IntervalInt(4) });
+        assert_eq!(list.len(), 4);
+    }
+
+    #[derive(Clone, Debug)]
+    struct IntervalStruct {
+        x: i32,
+        start: i64,
+        stop: i64,
+    }
+
+    impl IntervalValue for IntervalStruct {
+        fn set_range(&mut self, _old_range: Range<i64>, new_range: Range<i64>) {
+            self.start = new_range.start;
+            self.stop = new_range.end;
+        }
+    }
+
+    fn new_interval_struct(i: i32) -> IntervalStruct {
+        IntervalStruct {
+            x: i,
+            start: 0,
+            stop: 0,
+        }
+    }
+
+    #[test]
+    fn test_insert_interval_struct() {
+        let mut list = IntervalList::new();
+        list.insert(Interval { range: 0..64, ts_ns: 1, value: new_interval_struct(1) });
+        list.insert(Interval { range: 64..72, ts_ns: 2, value: new_interval_struct(2) });
+        list.insert(Interval { range: 72..136, ts_ns: 3, value: new_interval_struct(3) });
+        list.insert(Interval { range: 64..68, ts_ns: 4, value: new_interval_struct(4) });
+        assert_eq!(list.len(), 4);
     }
 }

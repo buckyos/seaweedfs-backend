@@ -68,13 +68,15 @@ struct FileChunkSection {
 
 impl FileChunkSection {
     fn new(section_index: SectionIndex, chunks: Vec<FileChunk>) -> Self {
+        log::trace!("new: section_index: {}, chunks: {:?}", section_index, chunks);
         // FIXME: should read resolved chunks when read at
         let visibles = chunks::read_resolved_chunks(&chunks, (section_index * SECTION_SIZE) as i64..((section_index + 1) * SECTION_SIZE) as i64);
+        log::trace!("new: section_index: {}, visibles: {:?}", section_index, visibles);
         let visables = visibles.iter().map(|visable| &visable.value.file_id).collect::<HashSet<_>>();
         let (compacted, _) = chunks.into_iter().partition(|chunk| visables.contains(&chunk.file_id));
         let chunk_views = visibles.iter().filter_map(|visable| {
             if visable.value.offset_in_chunk >= (section_index * SECTION_SIZE) as i64 && visable.value.offset_in_chunk < ((section_index + 1) * SECTION_SIZE) as i64 {
-                Some(Interval {
+                let view = Interval {
                     ts_ns: visable.ts_ns,
                     value: ChunkView {
                         file_id: visable.value.file_id.clone(),
@@ -84,7 +86,9 @@ impl FileChunkSection {
                         view_offset: visable.value.offset_in_chunk,
                     },
                     range: visable.value.offset_in_chunk..visable.value.offset_in_chunk + visable.value.chunk_size as i64,
-                })
+                };
+                log::trace!("new: section_index: {}, chunk_view: {:?}", section_index, view);
+                Some(view)
             } else {
                 None
             }
@@ -193,6 +197,7 @@ impl FileChunkSection {
         buf: &mut [u8], 
         offset: i64
     ) -> std::io::Result<(usize, u64)> {
+        log::trace!("read_at: section: {:?}, offset: {}, size: {}", self, offset, buf.len());
         {
             let mut mut_part = self.mut_part.lock().unwrap();
             mut_part.reader_pattern.monitor_read_at(offset, buf.len() as usize);

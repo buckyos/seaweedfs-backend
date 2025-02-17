@@ -8,7 +8,7 @@ use crate::chunk_cache::ChunkCache;
 use crate::chunks::{self, LookupFileId};
 use crate::interval_list::IntervalValue;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChunkView {
     pub file_id: String,
     pub offset_in_chunk: i64,
