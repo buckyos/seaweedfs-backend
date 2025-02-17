@@ -9,3 +9,21 @@ Go implementation:
 
 
 
+rust implementation:
+
+/opt/pjdfstest/tests/open/00.t (Wstat: 0 Tests: 47 Failed: 2)
+  Failed tests:  33-34
+/opt/pjdfstest/tests/open/05.t (Wstat: 0 Tests: 12 Failed: 1)
+  Failed test:  7
+/opt/pjdfstest/tests/open/06.t (Wstat: 0 Tests: 144 Failed: 63)
+  Failed tests:  18-19, 22-23, 26-27, 29, 31, 33, 35, 37
+                39, 41-43, 45-47, 49-51, 53-55, 57-59, 61-63
+                77-78, 81-82, 85-86, 88-90, 92-94, 96-98
+                100-102, 104-106, 108-110, 126, 128, 130
+                132, 134, 136, 138, 140, 142
+/opt/pjdfstest/tests/open/07.t (Wstat: 0 Tests: 25 Failed: 10)
+  Failed tests:  6, 8, 10, 12, 14, 16, 18, 20, 22-23
+/opt/pjdfstest/tests/open/08.t (Wstat: 0 Tests: 3 Failed: 2)
+  Failed tests:  2-3
+/opt/pjdfstest/tests/open/25.t (Wstat: 0 Tests: 6 Failed: 3)
+  Failed tests:  4-6

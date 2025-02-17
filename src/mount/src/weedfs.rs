@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
 };
-use libc::{ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
+use libc::{c_int, ENAMETOOLONG, ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
@@ -22,6 +22,13 @@ use futures::stream::StreamExt;
 
 thread_local! {
     static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
+}
+
+fn check_name(name: &OsStr) -> Option<c_int> {
+    if name.len() >= 256 {
+        return Some(ENAMETOOLONG);
+    }
+    None
 }
 
 
@@ -684,6 +691,11 @@ impl Filesystem for Wfs {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        if let Some(err) = check_name(link_name) {
+            log::trace!("symlink: name too long, name: {}", link_name.to_string_lossy());
+            reply.error(err);
+            return;
+        }
         let parent_path = self.get_path(parent);
         if parent_path.is_none() {
             log::trace!("symlink: parent not found, parent: {}", parent);
@@ -813,6 +825,11 @@ impl Filesystem for Wfs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        if let Some(err) = check_name(new_name) {
+            log::trace!("rename: new name too long, new_name: {}", new_name.to_string_lossy());
+            reply.error(err);
+            return;
+        }
         let old_parent_path = self.get_path(old_parent);
         if old_parent_path.is_none() {
             log::trace!("rename: old parent not found, old_parent: {}", old_parent);
@@ -868,6 +885,11 @@ impl Filesystem for Wfs {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        if let Some(err) = check_name(name) {
+            log::trace!("mkdir: name too long, name: {}", name.to_string_lossy());
+            reply.error(err);
+            return;
+        }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let entry = Entry {
             name: name.to_string_lossy().to_string(),
@@ -1089,6 +1111,11 @@ impl Filesystem for Wfs {
         name: &OsStr,
         reply: ReplyEntry,
     ) {
+        if let Some(err) = check_name(name) {
+            log::trace!("lookup: name too long, name: {}", name.to_string_lossy());
+            reply.error(err);
+            return;
+        }
         log::trace!("lookup: parent: {}, name: {}", parent, name.to_string_lossy());
         let full_path = {
             let inode_to_path = self.inner.inode_to_path.read().unwrap();
@@ -1146,6 +1173,11 @@ impl Filesystem for Wfs {
         reply: ReplyEntry,
     ) {
         log::trace!("mknod: parent: {}, name: {}, mode: {}, umask: {}, rdev: {}", parent, name.to_string_lossy(), mode, _umask, rdev);
+        if let Some(err) = check_name(name) {
+            log::trace!("mknod: name too long, name: {}", name.to_string_lossy());
+            reply.error(err);
+            return;
+        }
         let dir_full_path = self.get_path(parent);
         if dir_full_path.is_none() {
             log::trace!("mknod: parent not found, parent: {}", parent);
