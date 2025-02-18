@@ -155,10 +155,11 @@ impl FilerClient {
         })
     }
 
-    async fn with_retry<F, Fut, T>(&self, f: F) -> Result<T>
+    async fn with_retry_check_err<F, Fut, T, E>(&self, f: F, check_err: E) -> Result<T>
     where 
         F: Fn(SeaweedFilerClient<Channel>) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
+        Fut: std::future::Future<Output = Result<T>>, 
+        E: Fn(anyhow::Error) -> std::result::Result<anyhow::Error, anyhow::Error>,
     {
         let mut retries = 0;
         let mut delay = Duration::from_millis(100);
@@ -178,13 +179,20 @@ impl FilerClient {
                         return Ok(resp);
                     }
                     Ok(Err(e)) => {
-                        if i == self.clients.len() - 1 {
-                            if retries >= self.max_retries {
-                                return Err(anyhow::anyhow!("max retries reached: {}", e));
+                        match check_err(e) {
+                            Err(e) => {
+                                if i == self.clients.len() - 1 {
+                                    if retries >= self.max_retries {
+                                        return Err(anyhow::anyhow!("max retries reached: {}", e));
+                                    }
+                                    retries += 1;
+                                    sleep(delay).await;
+                                    delay *= 2;
+                                }
                             }
-                            retries += 1;
-                            sleep(delay).await;
-                            delay *= 2;
+                            Ok(e) => {
+                                return Err(e);
+                            }
                         }
                     }
                     Err(_) => {
@@ -200,6 +208,14 @@ impl FilerClient {
                 }
             }
         }
+    }
+
+    async fn with_retry<F, Fut, T>(&self, f: F) -> Result<T>
+    where 
+        F: Fn(SeaweedFilerClient<Channel>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.with_retry_check_err(f, |e| Ok(e)).await
     }
 
     pub fn prefer_address_index(&self) -> usize {
@@ -285,19 +301,27 @@ impl FilerClient {
             }
         }
 
-        self.with_retry(|mut client| {
-            let req = StreamRenameEntryRequest {
-                old_directory: old_path.parent().unwrap().to_string_lossy().to_string(),
-                old_name: old_path.file_name().unwrap().to_string_lossy().to_string(),
-                new_directory: new_path.parent().unwrap().to_string_lossy().to_string(),
-                new_name: new_path.file_name().unwrap().to_string_lossy().to_string(),
-                signatures: vec![],
-            };
-            async move {
-                let response = client.stream_rename_entry(req).await?;
-                Ok(RenameEntryStream(response.into_inner()))
-            }
-        }).await
+        self.with_retry_check_err(
+            |mut client| {
+                    let req = StreamRenameEntryRequest {
+                        old_directory: old_path.parent().unwrap().to_string_lossy().to_string(),
+                        old_name: old_path.file_name().unwrap().to_string_lossy().to_string(),
+                        new_directory: new_path.parent().unwrap().to_string_lossy().to_string(),
+                        new_name: new_path.file_name().unwrap().to_string_lossy().to_string(),
+                        signatures: vec![],
+                    };
+                    async move {
+                        let response = client.stream_rename_entry(req).await?;
+                        Ok(RenameEntryStream(response.into_inner()))
+                    }
+                }, 
+                |e| {
+                    if e.to_string().contains("is not empty") {
+                        Ok(e)
+                    } else {
+                        Err(e)
+                    }
+                }).await
     }
 
     pub async fn lookup_volume(&self, req: Vec<String>) -> Result<HashMap<String, Locations>> {

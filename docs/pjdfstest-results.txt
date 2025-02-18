@@ -11,15 +11,19 @@ Go implementation:
 
 rust implementation:
 
+open
 /opt/pjdfstest/tests/open/00.t (Wstat: 0 Tests: 47 Failed: 2)
   Failed tests:  33-34
 
+
+mknod
 /opt/pjdfstest/tests/mknod/00.t (Wstat: 0 Tests: 36 Failed: 2)
   Failed tests:  33-34
 /opt/pjdfstest/tests/mknod/11.t (Wstat: 0 Tests: 28 Failed: 4)
   Failed tests:  12-13, 25-26
 
 
+unlink
 /opt/pjdfstest/tests/unlink/00.t ........... 
 29, 34, 39, 44, 49,
 所有失败的测试都与时间戳（timestamp）检查有关
@@ -41,116 +45,44 @@ fstat 0 nlink：尝试获取文件的硬链接数
 实际返回值：ENOENT（No such file or directory）
 说明系统认为文件已经不存在了
 
+Link
 
-/opt/pjdfstest/tests/rmdir/06.t ............ 
-1..23
-ok 1
-ok 2
-not ok 3 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 4
-ok 5
-not ok 6 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 7
-ok 8
-not ok 9 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 10
-ok 11
-not ok 12 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 13
-ok 14
-not ok 15 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 16
-ok 17
-not ok 18 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 19
-ok 20
-not ok 21 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
-ok 22
-ok 23
-Failed 7/23 subtests 
+/opt/pjdfstest/tests/link/00.t (Wstat: 0 Tests: 202 Failed: 10)
+  Failed tests:  135-136, 142-143, 149-150, 156-157, 163-164
+它们都在测试"失败的链接操作不应更新时间戳"
+每对失败的测试（如135-136）对应一种文件类型（regular/fifo/block/char/socket）
 
 
-/opt/pjdfstest/tests/rename/23.t ........... 
-1..42
-ok 1
-ok 2
-ok 3
-not ok 4 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
-lstat returned -1
-ok 5
-not ok 6 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected regular,1, got ENOENT
-lstat returned -1
-not ok 7
-ok 8
-not ok 9 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
-ok 10
-ok 11
-not ok 12 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
-lstat returned -1
-ok 13
-not ok 14 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected fifo,1, got ENOENT
-not ok 15
-lstat returned -1
-ok 16
-not ok 17 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
-ok 18
-ok 19
-not ok 20 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
-lstat returned -1
-ok 21
-not ok 22 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected block,1, got ENOENT
-lstat returned -1
-not ok 23
-ok 24
-not ok 25 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
-ok 26
-ok 27
-not ok 28 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
-lstat returned -1
-ok 29
-not ok 30 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected char,1, got ENOENT
-lstat returned -1
-not ok 31
-ok 32
-not ok 33 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
-ok 34
-ok 35
-not ok 36 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
-lstat returned -1
-ok 37
-not ok 38 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected socket,1, got ENOENT
-not ok 39
-lstat returned -1
-ok 40
-not ok 41 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
-ok 42
-Failed 20/42 subtests 
-/opt/pjdfstest/tests/rename/24.t ........... 
-1..13
-ok 1
-ok 2
-ok 3
-not ok 4 - tried 'lstat pjdfstest_63546dca0725272a0ae4f24c7ccff0e7 nlink', expected 3, got 1
-not ok 5 - tried 'lstat pjdfstest_ee6155373b1ed128590e746cf0edece0 nlink', expected 2, got 1
-ok 6
-ok 7
-not ok 8 - tried 'lstat pjdfstest_63546dca0725272a0ae4f24c7ccff0e7 nlink', expected 2, got 1
-not ok 9 - tried 'lstat pjdfstest_ee6155373b1ed128590e746cf0edece0 nlink', expected 3, got 1
-ok 10
-ok 11
-ok 12
-ok 13
-Failed 4/13 subtests 
-/opt/pjdfstest/tests/rmdir/00.t ............ 
-1..10
-ok 1
-ok 2
-ok 3
-ok 4
-ok 5
-ok 6
-ok 7
-not ok 8
-not ok 9
-ok 10
-Failed 2/10 subtests 
+mkdir
+/opt/pjdfstest/tests/mkdir/00.t (Wstat: 0 Tests: 36 Failed: 2)
+  Failed tests:  33-34
+
+
+rename
+/opt/pjdfstest/tests/rename/23.t (Wstat: 0 Tests: 42 Failed: 5)
+  Failed tests:  7, 15, 23, 31, 39
+
+每个失败的测试都是在检查 ctime（change time）的更新
+测试场景：
+创建源文件和目标文件
+为目标文件创建硬链接
+重命名源文件到目标文件
+检查硬链接的 ctime 是否更新
+失败原因：
+时间戳更新问题：
+测试期望：重命名操作应该更新硬链接的 ctime
+实际：ctime 没有按预期更新
+
+
+/opt/pjdfstest/tests/rename/24.t (Wstat: 0 Tests: 13 Failed: 4)
+  Failed tests:  4-5, 8-9
+  目录链接数计算规则：
+每个目录默认有 2 个链接（. 和 ..）
+每个子目录会给父目录增加 1 个链接数
+期望的链接数：
+src_parent 初始应有 3 个链接（2 + 1个子目录）
+dst_parent 初始应有 2 个链接（默认的 . 和 ..）
+重命名后，src_parent 应变为 2，dst_parent 应变为 3
+实际情况：
+所有目录的链接数都显示为 1
+说明文件系统没有正确实现目录的硬链接计数

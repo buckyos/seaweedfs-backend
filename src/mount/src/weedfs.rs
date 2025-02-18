@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow
 };
-use libc::{c_int, ENAMETOOLONG, ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
+use libc::{c_int, ENOTEMPTY, ENAMETOOLONG, ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
@@ -978,8 +978,11 @@ impl Filesystem for Wfs {
             },
             Err(e) => {
                 log::trace!("rename: rename entry failed, error: {}", e);
-                reply.error(EIO);
-                return; 
+                if e.to_string().contains("is not empty") {
+                    reply.error(ENOTEMPTY);
+                } else {
+                    reply.error(EIO);
+                }
             }
         }
     }
