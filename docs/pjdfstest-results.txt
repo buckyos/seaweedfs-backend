@@ -32,27 +32,14 @@ rust implementation:
 
 /opt/pjdfstest/tests/unlink/14.t ........... 
   not ok 4 - tried 'open pjdfstest_eb776d2288a49ca9a14ed144f61ae430 O_RDONLY : unlink pjdfstest_eb776d2288a49ca9a14ed144f61ae430 : fstat 0 nlink', expected 0, got ENOENT
-ok 5
-^C
-
-/opt/pjdfstest/tests/symlink/00.t .......... 
-1..14
-ok 1
-ok 2
-ok 3
-ok 4
-ok 5
-ok 6
-ok 7
-ok 8
-ok 9
-ok 10
-not ok 11
-not ok 12
-ok 13
-ok 14
-Failed 2/14 subtests 
-/opt/pjdfstest/tests/s
+测试步骤：
+open ${n0} O_RDONLY：以只读方式打开文件
+unlink ${n0}：删除文件
+fstat 0 nlink：尝试获取文件的硬链接数
+错误信息：
+期望返回值：0（表示操作成功）
+实际返回值：ENOENT（No such file or directory）
+说明系统认为文件已经不存在了
 
 
 /opt/pjdfstest/tests/rmdir/06.t ............ 

@@ -66,14 +66,21 @@ impl PageWriter {
         })
     }
 
-    pub fn post_uploaded(&mut self, chunk_index: i64, ts_ns: u64)  {
-        if let Some(page) = self.sealed_chunks.get(&chunk_index) {
-            if page.latest_ts_ns() == ts_ns {
-                log::trace!("{:?} post_uploaded: sealed index: {}, ts_ns: {}", self, chunk_index, ts_ns);
-                self.sealed_chunks.remove(&chunk_index);
+    pub fn post_uploaded(&mut self, uploaded: Option<(i64, u64)>)  {
+        if let Some((chunk_index, ts_ns)) = uploaded {
+            if let Some(page) = self.sealed_chunks.get(&chunk_index) {
+                if page.latest_ts_ns() == ts_ns {
+                    log::trace!("{:?} post_uploaded: sealed index: {}, ts_ns: {}", self, chunk_index, ts_ns);
+                    self.sealed_chunks.remove(&chunk_index);
+                }
             }
-        }
-        if self.sealed_chunks.len() == 0 && self.writable_chunks.len() == 0 {
+            if self.sealed_chunks.len() == 0 && self.writable_chunks.len() == 0 {
+                log::trace!("{:?} post_uploaded: all flushed", self);
+                for sender in self.flush_waiters.drain(..) {
+                    sender.send(()).unwrap();
+                }
+            }
+        } else {
             log::trace!("{:?} post_uploaded: all flushed", self);
             for sender in self.flush_waiters.drain(..) {
                 sender.send(()).unwrap();

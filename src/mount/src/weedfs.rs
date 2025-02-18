@@ -903,7 +903,8 @@ impl Filesystem for Wfs {
             reply.error(ENOENT);
             return;
         }
-        let is_delete_data = entry.as_ref().unwrap().hard_link_counter <= 1;
+        let entry = entry.unwrap();
+        let is_delete_data = entry.hard_link_counter <= 1;
         match with_thread_local_runtime(
             self.filer_client().delete_entry(entry_full_path.as_path(), is_delete_data)
         ) {
@@ -915,6 +916,10 @@ impl Filesystem for Wfs {
             }
         }
 
+        let file_handle = self.get_handle_by_inode(entry.attributes.as_ref().unwrap().inode);
+        if let Some(file_handle) = file_handle {
+            file_handle.on_unlink();
+        }
         self.inner.inode_to_path.write().unwrap().remove_path(&entry_full_path.as_path());
         reply.ok();
     }
@@ -1502,7 +1507,7 @@ impl Filesystem for Wfs {
         &mut self, 
         _req: &Request, 
         ino: u64, 
-        _fh: Option<u64>, 
+        fh: Option<u64>, 
         reply: ReplyAttr
     ) {
         log::trace!("getattr: ino: {}", ino);
@@ -1516,8 +1521,16 @@ impl Filesystem for Wfs {
                 );
             }
             None => {
-                log::trace!("getattr: ino: {}, entry not found", ino);
-                reply.error(ENOENT);
+                if let Some(file_handle) = fh.and_then(|fh| self.get_handle_by_id(fh)) {
+                    log::trace!("getattr: ino: {}, entry not found, but fh found {}", ino, file_handle.id());
+                    reply.attr(
+                        &self.option().ttl,
+                        &EntryAttr::from((file_handle.entry(), ino, true)).into()
+                    );
+                } else {
+                    log::trace!("getattr: ino: {}, entry not found", ino);
+                    reply.error(ENOENT);
+                }
             }
         }
 

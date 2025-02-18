@@ -17,6 +17,7 @@ struct FileHandleMutPart<C: ChunkCache> {
     chunk_group: ChunkGroup<C>,
     page_writer: PageWriter,
     dirty: bool,
+    unlinked: bool,
 }
 
 pub trait FileHandleOwner: 'static + Clone + ChunkCache + LookupFileId + UploadChunk + Send + Sync {
@@ -75,7 +76,8 @@ impl<T: FileHandleOwner> FileHandle<T> {
                     entry,
                     chunk_group,
                     page_writer: PageWriter::new(handle_id, owner.chunk_size_limit(), owner.concurrent_writers()),
-                    dirty: false,
+                    dirty: false, 
+                    unlinked: false,
                 }),
                 owner,
             }),
@@ -110,8 +112,8 @@ impl<T: FileHandleOwner> FileHandle<T> {
         Ok(())
     }
 
-    pub fn full_path(&self) -> PathBuf {
-        self.owner().get_path(self.inner.inode).unwrap()
+    pub fn full_path(&self) -> Option<PathBuf> {
+        self.owner().get_path(self.inner.inode)
     }
 
     pub fn read(
@@ -155,6 +157,10 @@ impl<T: FileHandleOwner> FileHandle<T> {
 
     async fn upload(&self, uploads: Vec<(i64, u64)>) -> Result<()> {
         let full_path = self.full_path();
+        if full_path.is_none() {
+            return Err(anyhow::anyhow!("full path is none"));
+        }
+        let full_path = full_path.unwrap();
         for (chunk_index, ts_ns) in uploads {
             if let Some(mut chunks) = {
                 if let Some(page) = {
@@ -181,10 +187,17 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 let mut mut_part = self.inner.mut_part.write().unwrap();
                 mut_part.chunk_group.add_chunks(chunks.clone());
                 mut_part.entry.chunks.append(&mut chunks);
-                mut_part.page_writer.post_uploaded(chunk_index, ts_ns);
+                mut_part.page_writer.post_uploaded(Some((chunk_index, ts_ns)));
             }
         }
         Ok(())
+    }
+
+    pub fn on_unlink(&self) {
+        log::trace!("{:?} on_unlink", self);
+        let mut mut_part = self.inner.mut_part.write().unwrap();
+        mut_part.unlinked = true;
+        mut_part.page_writer.post_uploaded(None);
     }
 
     pub fn write(&self, data: &[u8], offset: i64) -> std::io::Result<usize> {
@@ -217,6 +230,10 @@ impl<T: FileHandleOwner> FileHandle<T> {
     pub async fn flush(&self) -> Result<()> {
         let (uploads, waiter) = {
             let mut mut_part = self.inner.mut_part.write().unwrap();
+            if mut_part.unlinked {
+                mut_part.dirty = false;
+                return Ok(());
+            }
             let (uploads, waiter) = mut_part.page_writer.flush();
             if uploads.is_some() {
                 mut_part.dirty = true;
@@ -245,18 +262,23 @@ impl<T: FileHandleOwner> FileHandle<T> {
         let mut mut_part = self.inner.mut_part.write().unwrap();    
 
         if mut_part.dirty {
-            let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), &self.full_path(), mut_part.entry.chunks.clone()).await
-                .map_err(|e| {
-                    log::error!("{:?} flush: compact chunks failed: {}", self, e);
-                    anyhow::anyhow!("compact chunks failed: {}", e)
-                })?;
-            mut_part.entry.chunks = manifest_chunks;
-            log::trace!("{:?} flush: create entry, chunks: {}", self, mut_part.entry.chunks.len());
-            self.owner().filer_client().create_entry(&self.full_path().parent().unwrap(), &mut_part.entry).await
-                .map_err(|e| {
-                    log::error!("{:?} flush: create entry failed: {}", self, e);
-                    anyhow::anyhow!("create entry failed: {}", e)
-                })?;
+            if let Some(full_path) = self.full_path() {
+                let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), full_path.as_path(), mut_part.entry.chunks.clone()).await
+                    .map_err(|e| {
+                        log::error!("{:?} flush: compact chunks failed: {}", self, e);
+                        anyhow::anyhow!("compact chunks failed: {}", e)
+                    })?;
+                mut_part.entry.chunks = manifest_chunks;
+                log::trace!("{:?} flush: create entry, chunks: {}", self, mut_part.entry.chunks.len());
+           
+                self.owner().filer_client().create_entry(&full_path.parent().unwrap(), &mut_part.entry).await
+                    .map_err(|e| {
+                        log::error!("{:?} flush: create entry failed: {}", self, e);
+                        anyhow::anyhow!("create entry failed: {}", e)
+                    })?;
+            } else {
+                log::trace!("{:?} flush: full path is none", self);
+            }
             mut_part.dirty = false;
         }
         
