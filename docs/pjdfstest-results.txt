@@ -14,3 +14,156 @@ rust implementation:
 /opt/pjdfstest/tests/open/00.t (Wstat: 0 Tests: 47 Failed: 2)
   Failed tests:  33-34
 
+/opt/pjdfstest/tests/mknod/00.t (Wstat: 0 Tests: 36 Failed: 2)
+  Failed tests:  33-34
+/opt/pjdfstest/tests/mknod/11.t (Wstat: 0 Tests: 28 Failed: 4)
+  Failed tests:  12-13, 25-26
+
+
+/opt/pjdfstest/tests/unlink/00.t ........... 
+29, 34, 39, 44, 49,
+所有失败的测试都与时间戳（timestamp）检查有关
+测试期望：创建硬链接后，原文件的 ctime（change time）应该更新
+
+
+74-75, 80-81, 86-87, 92-93, 98-99, 104-105, 110
+这些测试都是在测试"失败的链接操作不应该更新时间戳"
+
+
+/opt/pjdfstest/tests/unlink/14.t ........... 
+  not ok 4 - tried 'open pjdfstest_eb776d2288a49ca9a14ed144f61ae430 O_RDONLY : unlink pjdfstest_eb776d2288a49ca9a14ed144f61ae430 : fstat 0 nlink', expected 0, got ENOENT
+ok 5
+^C
+
+/opt/pjdfstest/tests/symlink/00.t .......... 
+1..14
+ok 1
+ok 2
+ok 3
+ok 4
+ok 5
+ok 6
+ok 7
+ok 8
+ok 9
+ok 10
+not ok 11
+not ok 12
+ok 13
+ok 14
+Failed 2/14 subtests 
+/opt/pjdfstest/tests/s
+
+
+/opt/pjdfstest/tests/rmdir/06.t ............ 
+1..23
+ok 1
+ok 2
+not ok 3 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 4
+ok 5
+not ok 6 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 7
+ok 8
+not ok 9 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 10
+ok 11
+not ok 12 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 13
+ok 14
+not ok 15 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 16
+ok 17
+not ok 18 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 19
+ok 20
+not ok 21 - tried 'rmdir pjdfstest_e2981c6f9a40bbb45c38324b5f3eb8dc', expected EEXIST|ENOTEMPTY, got EIO
+ok 22
+ok 23
+Failed 7/23 subtests 
+
+
+/opt/pjdfstest/tests/rename/23.t ........... 
+1..42
+ok 1
+ok 2
+ok 3
+not ok 4 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
+lstat returned -1
+ok 5
+not ok 6 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected regular,1, got ENOENT
+lstat returned -1
+not ok 7
+ok 8
+not ok 9 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
+ok 10
+ok 11
+not ok 12 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
+lstat returned -1
+ok 13
+not ok 14 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected fifo,1, got ENOENT
+not ok 15
+lstat returned -1
+ok 16
+not ok 17 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
+ok 18
+ok 19
+not ok 20 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
+lstat returned -1
+ok 21
+not ok 22 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected block,1, got ENOENT
+lstat returned -1
+not ok 23
+ok 24
+not ok 25 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
+ok 26
+ok 27
+not ok 28 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
+lstat returned -1
+ok 29
+not ok 30 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected char,1, got ENOENT
+lstat returned -1
+not ok 31
+ok 32
+not ok 33 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
+ok 34
+ok 35
+not ok 36 - tried 'link pjdfstest_366f9b21226c5c738a299ce1cd40bd2a pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got EPERM
+lstat returned -1
+ok 37
+not ok 38 - tried 'lstat pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97 type,nlink', expected socket,1, got ENOENT
+not ok 39
+lstat returned -1
+ok 40
+not ok 41 - tried 'unlink pjdfstest_5f7734db63c1b4d4c04d483e19aa8e97', expected 0, got ENOENT
+ok 42
+Failed 20/42 subtests 
+/opt/pjdfstest/tests/rename/24.t ........... 
+1..13
+ok 1
+ok 2
+ok 3
+not ok 4 - tried 'lstat pjdfstest_63546dca0725272a0ae4f24c7ccff0e7 nlink', expected 3, got 1
+not ok 5 - tried 'lstat pjdfstest_ee6155373b1ed128590e746cf0edece0 nlink', expected 2, got 1
+ok 6
+ok 7
+not ok 8 - tried 'lstat pjdfstest_63546dca0725272a0ae4f24c7ccff0e7 nlink', expected 2, got 1
+not ok 9 - tried 'lstat pjdfstest_ee6155373b1ed128590e746cf0edece0 nlink', expected 3, got 1
+ok 10
+ok 11
+ok 12
+ok 13
+Failed 4/13 subtests 
+/opt/pjdfstest/tests/rmdir/00.t ............ 
+1..10
+ok 1
+ok 2
+ok 3
+ok 4
+ok 5
+ok 6
+ok 7
+not ok 8
+not ok 9
+ok 10
+Failed 2/10 subtests 

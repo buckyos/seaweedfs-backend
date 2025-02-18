@@ -96,6 +96,12 @@ impl InodeToPath {
         }
     }
 
+    pub fn add_path(&mut self, inode: u64, path: PathBuf) {
+        self.path_to_inode.insert(path.clone(), inode);
+        self.inode_to_path.entry(inode).or_insert(InodeEntry { path: vec![], nlookup: 1, is_directory: false })
+            .path.push(path);
+    }
+
     pub fn lookup(
         &mut self, 
         path: &Path, 

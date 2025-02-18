@@ -13,7 +13,7 @@ use dfs_common::chunks::{self, LookupFileId, UploadChunk};
 use dfs_common::{ChunkCache, ChunkCacheInMem};
 use crate::file::{FileHandle, FileHandleId, FileHandleOwner};
 use crate::path::{InodeToPath, ROOT_INODE};
-use rand::seq::SliceRandom;
+use rand::{RngCore, rng, prelude::SliceRandom};
 use std::thread_local;
 use std::cell::RefCell;
 use tokio::runtime::Runtime;
@@ -682,7 +682,111 @@ fn to_unix_time(time: TimeOrNow) -> i64 {
     }
 }
 
+fn new_hard_link_id() -> Vec<u8> {
+    let mut id = vec![0; 17];
+    id[0] = 0x01;
+    rng().fill_bytes(&mut id[1..17]);
+    id
+}
+
 impl Filesystem for Wfs {
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        if let Some(err) = check_name(newname) {
+            log::trace!("link: name too long, name: {}", newname.to_string_lossy());
+            reply.error(err);
+            return;
+        }
+        
+        let old_entry_path = self.get_path(ino);
+        if old_entry_path.is_none() {
+            log::trace!("link: old entry not found, ino: {}", ino);
+            reply.error(ENOENT);
+            return;
+        }
+        let old_entry_path = old_entry_path.unwrap();
+        
+        let new_parent_path = self.get_path(newparent);
+        if new_parent_path.is_none() {
+            log::trace!("link: new parent not found, newparent: {}", newparent);
+            reply.error(ENOENT);
+            return;
+        }
+        let new_parent_path = new_parent_path.unwrap();
+
+        let old_entry = with_thread_local_runtime(self.get_entry_by_path(old_entry_path.as_path()));
+        if old_entry.is_none() {
+            log::trace!("link: old entry not found, path: {}", old_entry_path.to_string_lossy());
+            reply.error(ENOENT);
+            return;
+        }
+        let mut old_entry = old_entry.unwrap();
+
+        // hardlink is not allowed in WORM mode
+        // if wormEnforced, _ := wfs.wormEnforcedForEntry(oldEntryPath, oldEntry); wormEnforced {
+        //     return fuse.EPERM
+        // }
+
+        // update old file to hardlink mode
+        if old_entry.hard_link_id.is_empty() {
+            old_entry.hard_link_id = new_hard_link_id();
+            old_entry.hard_link_counter = 1;
+        }
+        old_entry.hard_link_counter += 1;
+        old_entry.attributes.as_mut().unwrap().mtime = to_unix_time(TimeOrNow::Now);
+       
+        match with_thread_local_runtime(
+            self.filer_client().update_entry(
+                old_entry_path.parent().unwrap(),
+                old_entry.clone()
+            )
+        ) {
+            Ok(_) => {
+            },
+            Err(e) => {
+                log::trace!("link: update entry failed, error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        let mut new_entry = old_entry;
+        new_entry.name = newname.to_string_lossy().to_string();
+
+        match with_thread_local_runtime(
+            self.filer_client().create_entry(
+                &new_parent_path,
+                &new_entry
+            )
+        ) {
+            Ok(_) => {
+            },
+            Err(e) => {
+                log::trace!("link: create entry failed, error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        }
+
+        let new_entry_path = new_parent_path.join(newname);
+        self.inner.inode_to_path.write().unwrap().add_path(
+            ino,
+            new_entry_path
+        );
+
+        reply.entry(    
+            &self.option().ttl, 
+            &EntryAttr::from((new_entry, ino, true)).into(), 
+            1
+        );
+    }
+
     fn symlink(
         &mut self,
         _req: &Request<'_>,
