@@ -254,28 +254,37 @@ impl FilerClient {
     }
 
     pub async fn delete_entry(&self, path: &Path, is_delete_data: bool) -> Result<()> {
-        self.with_retry(|mut client| {
-            let req = DeleteEntryRequest {
-                directory: path.parent().unwrap().to_string_lossy().to_string(),
-                name: path.file_name().unwrap().to_string_lossy().to_string(),
-                is_delete_data,
-                is_recursive: false,
-                ignore_recursive_error: true,
-                is_from_other_cluster: false,
-                signatures: vec![],
-                if_not_modified_after: 0,
-            };
-            async move {
-                let resp = client.delete_entry(req).await?.into_inner();
-                if resp.error == Self::no_error() {
-                    Ok(())
-                } else if resp.error == Self::error_not_found() {
-                    Ok(())
+        self.with_retry_check_err(
+            |mut client| {
+                    let req = DeleteEntryRequest {
+                        directory: path.parent().unwrap().to_string_lossy().to_string(),
+                        name: path.file_name().unwrap().to_string_lossy().to_string(),
+                        is_delete_data,
+                        is_recursive: false,
+                        ignore_recursive_error: true,
+                    is_from_other_cluster: false,
+                    signatures: vec![],
+                    if_not_modified_after: 0,
+                };
+                async move {
+                    let resp = client.delete_entry(req).await?.into_inner();
+                    if resp.error == Self::no_error() {
+                        Ok(())
+                    } else if resp.error == Self::error_not_found() {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("{}", resp.error))
+                    }
+                }
+            }, 
+            |e| {
+                if e.to_string().contains("fail to delete non-empty folder") {
+                    Ok(e)
                 } else {
-                    Err(anyhow::anyhow!("{}", resp.error))
+                    Err(e)
                 }
             }
-        }).await
+        ).await
     }
 
     pub async fn rename_entry(&self, old_path: &Path, new_path: &Path) -> Result<impl Stream<Item = Result<StreamRenameEntryResponse>>> {

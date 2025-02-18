@@ -1079,7 +1079,11 @@ impl Filesystem for Wfs {
             Ok(_) => (),
             Err(e) => {
                 log::trace!("rmdir: delete entry failed, error: {}", e);
-                reply.error(EIO);
+                if e.to_string().contains("fail to delete non-empty folder") {
+                    reply.error(ENOTEMPTY);
+                } else {
+                    reply.error(EIO);
+                }
                 return;
             }
         }
