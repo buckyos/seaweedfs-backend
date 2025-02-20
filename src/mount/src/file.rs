@@ -123,10 +123,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
     ) -> std::io::Result<(usize, u64)> {
         let mut_part = &self.inner.mut_part.read().unwrap();
         let (read, ts_ns) = {
-            let mut file_size = mut_part.entry.attributes.as_ref().unwrap().file_size;
-            if file_size == 0 {
-                file_size = mut_part.entry.file_size();
-            }
+            let file_size = mut_part.chunk_group.file_size();
             if file_size == 0 {
                 (0, 0)
             } else if offset as u64 == file_size {
@@ -139,7 +136,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 let total_read = mut_part.entry.content.len() - offset as usize;
                 (total_read, 0)
             } else {
-                mut_part.chunk_group.read_at(self.owner(), file_size, buff, offset as u64)
+                mut_part.chunk_group.read(self.owner(), buff, offset as u64)
                     .map_err(|e| {
                         log::error!("{:?} read: read from chunk group failed: {}", self, e);
                         e

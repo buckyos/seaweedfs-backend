@@ -357,13 +357,13 @@ pub fn fetch_whole_chunk(
 
 pub fn fetch_chunk_range(
     lookup: &impl LookupFileId, 
-    chunks_buffer: &mut [u8],
+    buf: &mut [u8],
     file_id: &str,
     offset: i64
 ) -> Result<usize> {
-    let size = chunks_buffer.len();
+    let size = buf.len();
     let url_strings = lookup.lookup(file_id)?;
-    retried_fetch_chunk_data(chunks_buffer, url_strings, false, offset, size)
+    retried_fetch_chunk_data(buf, url_strings, false, offset, size)
 }
 
 // resolve one chunk manifest

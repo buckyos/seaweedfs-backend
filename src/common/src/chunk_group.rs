@@ -152,18 +152,18 @@ impl FileChunkSection {
         buf: &mut [u8], 
         chunk_view: &ChunkView, 
         next_chunk_views: impl Iterator<Item = &'a ChunkView>,
-        offset: u64
+        offset_in_chunk: u64
     ) -> std::io::Result<usize> {
-        log::trace!("read_chunk_slice_at: section: {}, chunk: {}, offset: {}", self.section_index, chunk_view.file_id, offset);
+        log::trace!("read_chunk_slice_at: section: {}, chunk: {}, offset_in_chunk: {}", self.section_index, chunk_view.file_id, offset_in_chunk);
         let mut mut_part = self.mut_part.lock().unwrap();
         if mut_part.reader_pattern.is_random_mode() {
-            match reader_cache.outer_cache().read(buf, &chunk_view.file_id, offset as usize) {
+            match reader_cache.outer_cache().read(buf, &chunk_view.file_id, offset_in_chunk as usize) {
                 Ok(n) => return Ok(n),
                 Err(e) => {
                     match e.kind() {
                         std::io::ErrorKind::NotFound => {
                             log::trace!("read_chunk_slice_at: fetch_chunk_range: section: {}, chunk: {}", self.section_index, chunk_view.file_id);
-                            return chunks::fetch_chunk_range(lookup, buf, &chunk_view.file_id, offset as i64)
+                            return chunks::fetch_chunk_range(lookup, buf, &chunk_view.file_id, offset_in_chunk as i64)
                                 .map_err(|e| {
                                     log::trace!("read_chunk_slice_at: fetch_chunk_range: section: {}, chunk: {}, error: {}", self.section_index, chunk_view.file_id, e);
                                     std::io::Error::new(std::io::ErrorKind::Other, e)
@@ -175,7 +175,7 @@ impl FileChunkSection {
             }
         } else {
             let should_cache = (chunk_view.view_offset as u64 + chunk_view.view_size) <= reader_cache.outer_cache().max_file_part_size();
-            let read = reader_cache.read_at(lookup, buf, &chunk_view.file_id, offset as usize, chunk_view.chunk_size as usize, should_cache)?;
+            let read = reader_cache.read_at(lookup, buf, &chunk_view.file_id, offset_in_chunk as usize, chunk_view.chunk_size as usize, should_cache)?;
             if mut_part.last_chunk_fid.is_none() || mut_part.last_chunk_fid.as_ref().unwrap() != &chunk_view.file_id {
                 if let Some(last_chunk_fid) = mut_part.last_chunk_fid.as_ref() {
                     reader_cache.uncache(last_chunk_fid);
@@ -187,12 +187,12 @@ impl FileChunkSection {
         }
     }
 
-    fn read_at<T: ChunkCache>(
+    fn read<T: ChunkCache>(
         &self, 
         lookup: &impl LookupFileId, 
-        file_size: u64,
         reader_cache: &ReaderCache<T>, 
         buf: &mut [u8], 
+        /* offset in the file */
         offset: i64
     ) -> std::io::Result<(usize, u64)> {
         log::trace!("read_at: section: {:?}, offset: {}, size: {}", self, offset, buf.len());
@@ -205,7 +205,9 @@ impl FileChunkSection {
         let mut read = 0;
         let mut ts_ns = 0;
         let mut remaining = buf.len() as i64;
-        for (i, view) in self.chunk_views.iter().enumerate() {
+        for (i, view) in self.chunk_views.iter().enumerate()
+            .skip_while(|(_, view)| view.value.view_offset + (view.value.view_size as i64) <= offset) {
+            // log::trace!("read: section: {:?}, view_index: {}, view: {:?}, start: {}, remaining: {}", self, i, view, start, remaining);
             if start < view.value.view_offset {
                 let gap = (view.value.view_offset - start) as usize;
                 buf[(start - offset) as usize..(start - offset) as usize + gap].fill(0);
@@ -219,7 +221,7 @@ impl FileChunkSection {
 
             let chunk_range = max(view.value.view_offset, start)..min(view.value.view_offset + view.value.view_size as i64, start + remaining);
             ts_ns = view.ts_ns;
-            let chunk_offset = chunk_range.start - view.value.view_offset + view.value.offset_in_chunk;
+            let offset_in_chunk = chunk_range.start - view.value.view_offset + view.value.offset_in_chunk;
             
             let n = self.read_chunk_slice_at(
                 lookup, 
@@ -227,7 +229,7 @@ impl FileChunkSection {
                 &mut buf[(start - offset) as usize..(start - offset) as usize + (chunk_range.end - chunk_range.start) as usize], 
                 &view.value, 
                 self.chunk_views.iter().skip(i + 1).map(|v| &v.value),
-                chunk_offset as u64
+                offset_in_chunk as u64
             )?;
             start += n as i64;
             remaining -= n as i64;
@@ -238,10 +240,9 @@ impl FileChunkSection {
         }
 
         if remaining > 0 {
-            let delta = min(remaining as usize, (file_size - start as u64) as usize);
-            log::trace!("read_at: section: {:?}, remaining: {}, delta: {}", self, remaining, delta);
-            buf[(start - offset) as usize..(start - offset) as usize + delta].fill(0);
-            read += delta;
+            log::trace!("read_at: section: {:?}, remaining: {}", self, remaining);
+            buf[(start - offset) as usize..].fill(0);
+            read += remaining as usize;
         }
 
         Ok((read, ts_ns as u64))
@@ -284,6 +285,10 @@ impl<T: ChunkCache> ChunkGroup<T> {
         }
     }
 
+    pub fn file_size(&self) -> u64 {
+        self.mut_part.read().unwrap().file_size
+    }
+
     pub fn set_chunks(
         &self, 
         lookup: &impl LookupFileId, 
@@ -319,26 +324,22 @@ impl<T: ChunkCache> ChunkGroup<T> {
         Ok(())
     }
 
-    pub fn read_at(
+    pub fn read(
         &self, 
         lookup: &impl LookupFileId, 
-        file_size: u64, 
-        buf: &mut [u8], 
-        offset: u64
+        buf: &mut [u8],
+        /* offset in the file */ 
+        offset: u64 
     ) -> std::io::Result<(usize, u64)> {
-        if offset >= file_size {
-            return Ok((0, 0));
-        }
         let mut read = 0;
         let mut ts_ns = 0;
         let mut_part = self.mut_part.read().unwrap();
         let index_range = offset / SECTION_SIZE..(offset + buf.len() as u64) / SECTION_SIZE + 1;
         for si in index_range {
-            let read_range = max(offset, si * SECTION_SIZE)..min(offset + buf.len() as u64, (si + 1) * SECTION_SIZE);
+            let read_range = max(offset, si * SECTION_SIZE)..min(offset + buf.len() as u64, min(mut_part.file_size, (si + 1) * SECTION_SIZE));
             if let Some(section) = mut_part.sections.get(&si) {
-                let (n, ns) = section.read_at(
+                let (n, ns) = section.read(
                     lookup, 
-                    mut_part.file_size, 
                     &self.reader_cache, 
                     &mut buf[(read_range.start - offset) as usize..(read_range.end - offset) as usize], 
                     read_range.start as i64
@@ -349,7 +350,7 @@ impl<T: ChunkCache> ChunkGroup<T> {
                 read += n;
                 ts_ns = max(ts_ns, ns);
             } else {
-                let read_range = read_range.start..min(read_range.end, file_size);
+                let read_range = read_range.start..min(read_range.end, mut_part.file_size);
                 buf[(read_range.start - offset) as usize..(read_range.end - offset) as usize].fill(0);
             }
         }

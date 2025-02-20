@@ -11,9 +11,13 @@ use crate::interval_list::IntervalValue;
 #[derive(Clone, Debug)]
 pub struct ChunkView { 
     pub file_id: String,
+    // view's start offset in the file
     pub offset_in_chunk: i64,
+    // chunk's total size
     pub chunk_size: u64,
+    // view's size
     pub view_size: u64,
+    // view's offset in the file
     pub view_offset: i64,
 }
 

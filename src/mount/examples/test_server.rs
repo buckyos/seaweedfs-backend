@@ -5,6 +5,7 @@ use std::io::Write;
 fn main() {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Trace)
+        .filter_module("ureq", log::LevelFilter::Off)
         .format(|buf, record| {
             writeln!(buf,
                 "{} [{}:{}] {}",
