@@ -148,7 +148,7 @@ impl<T: ChunkCache> ReaderCache<T> {
         let read = min(chunk_size - offset, buf.len());
         if let Some(data) = downloded {
             log::trace!("read_at: downloaded: file_id: {}, offset: {}, chunk_size: {}", file_id, offset, chunk_size);
-            buf[..read].copy_from_slice(&data.as_slice()[offset..read]);
+            buf[..read].copy_from_slice(&data.as_slice()[offset..offset + read]);
             return Ok(read);
         }
         
@@ -178,7 +178,7 @@ impl<T: ChunkCache> ReaderCache<T> {
             *downloading = Some(data.clone());
             data
         };
-        buf[..read].copy_from_slice(&data.as_slice()[offset..read]);
+        buf[..read].copy_from_slice(&data.as_slice()[offset..offset + read]);
         Ok(read)
     }
 }

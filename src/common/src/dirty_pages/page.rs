@@ -1,6 +1,6 @@
 use tokio::fs::File;
 pub trait ChunkPage {
-    fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> u64;
+    fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> Option<u64>;
     fn latest_ts_ns(&self) -> u64;
     fn is_complete(&self) -> bool;
     fn written_size(&self) -> u64;

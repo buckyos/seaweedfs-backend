@@ -425,6 +425,7 @@ pub fn retried_fetch_chunk_data(
     size: usize
 ) -> Result<usize> {
     let agent = ureq::config::Config::builder()
+        .max_response_header_size(1024 * 1024)
         .timeout_global(Some(Duration::from_secs(30)))
         .build().new_agent();
     let mut last_err = None;
@@ -455,6 +456,7 @@ pub fn retried_fetch_chunk_data(
                     return Ok(n as usize);
                 }
                 Err(e) => {
+                    log::trace!("retried_fetch_chunk_data: url: {} offset: {}, size: {}, error: {}", url, offset, size, e);
                     last_err = Some(e);
                     continue;
                 }

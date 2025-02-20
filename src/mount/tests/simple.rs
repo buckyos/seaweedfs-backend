@@ -1,5 +1,5 @@
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use std::collections::HashMap;
 use rand::{rng, Rng};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -30,13 +30,6 @@ async fn test_simple_io() {
     file.read(&mut buffer).await.unwrap();
     
     assert_eq!(&buffer, b"Hello, world!");
-}
-
-async fn create_random_content() -> Vec<u8> {
-    let len = rng().random_range(10..1000);
-    let mut content = vec![0u8; len];
-    rng().fill(&mut content[..]);
-    content
 }
 
 async fn write_file(path: &std::path::Path, content: &[u8]) -> anyhow::Result<()> {
@@ -146,4 +139,55 @@ async fn test_simple_dir_tree() -> anyhow::Result<()> {
     tokio::fs::remove_dir_all(&test_dir).await?;
     
     Ok(())
+}
+
+#[tokio::test]
+async fn test_multi_write() {
+    env_logger::builder().filter_level(log::LevelFilter::Info).init();
+    let tmp_dir = std::env::temp_dir().join("weedfs_test");
+   
+    let file_path = tmp_dir.join("test_multi_write");
+    
+    // 先创建并设置大小
+    {
+        let file = File::create(&file_path).await.unwrap();
+        file.set_len(1024 * 1024).await.unwrap();
+    }
+
+    // 重新打开文件进行读写
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .await
+        .unwrap();
+
+    // 在不同偏移写入数据
+    let writes = vec![
+        (100, "data at 100"),
+        (1000, "data at 1000"),
+        (10000, "data at 10000"),
+        (100000, "data at 100000"),
+    ];
+
+    for (offset, data) in &writes {
+        file.seek(std::io::SeekFrom::Start(*offset)).await.unwrap();
+        file.write_all(data.as_bytes()).await.unwrap();
+    }
+
+    // 读取末尾未写入部分的数据
+    let read_offset = 1024 * 1024 - 1000;
+    let read_size = 100;
+    let mut buf = vec![0u8; read_size];
+
+    file.seek(std::io::SeekFrom::Start(read_offset)).await.unwrap();
+    let n = file.read(&mut buf).await.unwrap();
+    
+    assert_eq!(n, read_size);
+    assert!(buf.iter().all(|&b| b == 0), 
+        "Expected all zeros in unwritten region at offset {}", read_offset);
+
+    // 清理
+    drop(file); // 确保文件已关闭
+    tokio::fs::remove_file(&file_path).await.unwrap();
 }

@@ -147,10 +147,14 @@ impl PageWriter {
         while remaining_data.len() > 0 {
             let read_size = min(remaining_data.len(), ((chunk_index + 1) * self.chunk_size as i64 - offset) as usize);
             if let Some(page) = self.sealed_chunks.get(&chunk_index) {
-                max_stop = Some(max(max_stop.unwrap_or_default(), page.read(&mut remaining_data[..read_size], offset, ts_ns)));
+                if let Some(read_stop) = page.read(&mut remaining_data[..read_size], offset, ts_ns) {
+                    max_stop = Some(max(read_stop, max_stop.unwrap_or_default()))
+                }
             } 
             if let Some(page) = self.writable_chunks.get(&chunk_index) {
-                max_stop = Some(max(max_stop.unwrap_or_default(), page.read(&mut remaining_data[..read_size], offset, ts_ns)));
+                if let Some(read_stop) = page.read(&mut remaining_data[..read_size], offset, ts_ns) {
+                    max_stop = Some(max(read_stop, max_stop.unwrap_or_default()))
+                }
             }
             remaining_data = &mut remaining_data[read_size..];
             offset += read_size as i64;
@@ -187,4 +191,33 @@ impl PageWriter {
             None
         }
     }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_page_writer() {
+        let mut writer = PageWriter::new(0, 2 * 1024 * 1024, 10);
+        let writes = vec![
+            (100, "data at 100"),
+            (1000, "data at 1000"),
+            (10000, "data at 10000"),
+            (100000, "data at 100000"),
+        ];
+
+        for (offset, data) in writes {
+            writer.write(offset, data.as_bytes(), 0);
+        }
+
+        let read_offset = 1024 * 1024 - 1000;
+        let read_size = 100;
+        let mut buf = vec![0u8; read_size];
+        let max_stop = writer.read(&mut buf, read_offset, 0);
+        
+        assert_eq!(max_stop, None);
+    }
+    
 }

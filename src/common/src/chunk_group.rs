@@ -207,9 +207,9 @@ impl FileChunkSection {
         let mut remaining = buf.len() as i64;
         for (i, view) in self.chunk_views.iter().enumerate()
             .skip_while(|(_, view)| view.value.view_offset + (view.value.view_size as i64) <= offset) {
-            // log::trace!("read: section: {:?}, view_index: {}, view: {:?}, start: {}, remaining: {}", self, i, view, start, remaining);
+            log::trace!("read: section: {:?}, view_index: {}, view: {:?}, start: {}, remaining: {}", self, i, view, start, remaining);
             if start < view.value.view_offset {
-                let gap = (view.value.view_offset - start) as usize;
+                let gap = min(view.value.view_offset - start, remaining) as usize;
                 buf[(start - offset) as usize..(start - offset) as usize + gap].fill(0);
                 start = view.value.view_offset;
                 read += gap;
@@ -352,6 +352,7 @@ impl<T: ChunkCache> ChunkGroup<T> {
             } else {
                 let read_range = read_range.start..min(read_range.end, mut_part.file_size);
                 buf[(read_range.start - offset) as usize..(read_range.end - offset) as usize].fill(0);
+                read += (read_range.end - read_range.start) as usize;
             }
         }
 

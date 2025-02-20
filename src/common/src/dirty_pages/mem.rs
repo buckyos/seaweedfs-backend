@@ -1,4 +1,4 @@
-use std::{cmp::{max, min}, sync::Arc};
+use std::{cmp::{max, min}, sync::Arc, fmt};
 use super::page::*;
 use crate::interval_list::{Interval, IntervalList};
 
@@ -6,6 +6,12 @@ pub struct MemPage {
     chunk_index: i64,
     data: Vec<u8>,
     usage: IntervalList<()>,
+}
+
+impl fmt::Debug for MemPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MemPage {{ chunk_index: {}, usage: {:?} }}", self.chunk_index, self.usage)
+    }
 }
 
 impl MemPage {
@@ -31,17 +37,18 @@ impl WritableChunkPage for MemPage {
 }
 
 impl ChunkPage for MemPage {
-    fn read(&self, data: &mut [u8], offset: i64, _ts_ns: u64) -> u64 {
-        let mut max_stop = 0;
+    fn read(&self, data: &mut [u8], offset: i64, _ts_ns: u64) -> Option<u64> {
+        log::trace!("read: mem page: {:?}, offset: {}, data: {}", self, offset, data.len());
+        let mut max_stop = None;
         let chunk_offset = self.chunk_index * self.data.len() as i64;
         for interval in self.usage.iter() {
             let range = max(offset, chunk_offset as i64 + interval.range.start)..min(offset + data.len() as i64, chunk_offset as i64 + interval.range.end);
             if range.start < range.end {
                 data[(range.start - offset) as usize..(range.end - offset) as usize].copy_from_slice(&self.data[(range.start - chunk_offset) as usize..(range.end - chunk_offset) as usize]);
-                max_stop = max(max_stop, range.end);
+                max_stop = Some(max(max_stop.unwrap_or_default(), range.end as u64));
             }
         }
-        max_stop as u64
+        max_stop
     }
 
     fn latest_ts_ns(&self) -> u64 {
@@ -66,7 +73,7 @@ impl From<MemPage> for SealedMemPage {
 }
 
 impl ChunkPage for SealedMemPage {
-    fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> u64 {
+    fn read(&self, data: &mut [u8], offset: i64, ts_ns: u64) -> Option<u64> {
         self.0.read(data, offset, ts_ns)
     }
 
