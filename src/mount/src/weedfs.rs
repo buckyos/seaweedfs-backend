@@ -329,7 +329,7 @@ impl Wfs {
             }
         };
 
-        let (mut same_dc_locations, mut other_locations) = if let Some(locations) = cached_locations {
+        let (same_dc_locations, other_locations) = if let Some(locations) = cached_locations {
             locations
         } else {
             let mut locations = self.filer_client().lookup_volume(vec![vid.clone()]).await
@@ -345,27 +345,30 @@ impl Wfs {
             for location in locations.locations {
                 if location.data_center == self.option().data_center {
                     if pulic_url {
-                        same_dc_locations.push(format!("http://{}/{}", location.public_url, file_id.to_string()));
+                        same_dc_locations.push(location.public_url);
                     } else {
-                        same_dc_locations.push(format!("http://{}/{}", location.url, file_id.to_string()));
+                        same_dc_locations.push(location.url);
                     }
                 } else {
                     if pulic_url {
-                        other_locations.push(format!("http://{}/{}", location.public_url, file_id.to_string()));
+                        other_locations.push(location.public_url);
                     } else {
-                        other_locations.push(format!("http://{}/{}", location.url, file_id.to_string()));
+                        other_locations.push(location.url);
                     }
                 }
             }
             self.inner.volume_location_cache.write().unwrap().insert(vid, (same_dc_locations.clone(), other_locations.clone()));
             (same_dc_locations, other_locations)
         };
-       
+
+        let mut same_dc_urls: Vec<String> = same_dc_locations.into_iter().map(|location| format!("http://{}/{}", location, file_id.to_string())).collect();
+        same_dc_urls.shuffle(&mut rand::rng());
+        let mut other_urls: Vec<String> = other_locations.into_iter().map(|location| format!("http://{}/{}", location, file_id.to_string())).collect();
+        other_urls.shuffle(&mut rand::rng());
         
-        same_dc_locations.shuffle(&mut rand::rng());
-        other_locations.shuffle(&mut rand::rng());
-        same_dc_locations.append(&mut other_locations);
-        Ok(same_dc_locations)
+        let mut urls = same_dc_urls;
+        urls.append(&mut other_urls);
+        Ok(urls)
     }
 
     async fn list_entries(&self, mut reply: ReplyDirectory, path: PathBuf, fh: DirectoryHandleId, handle: Arc<Mutex<DirectoryHandle>>, start_from: String, is_plus: bool) {

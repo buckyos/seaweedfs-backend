@@ -175,7 +175,7 @@ impl FileChunkSection {
             }
         } else {
             let should_cache = (chunk_view.view_offset as u64 + chunk_view.view_size) <= reader_cache.outer_cache().max_file_part_size();
-            let read = reader_cache.read_at(lookup, buf, &chunk_view.file_id, offset as usize, chunk_view.view_size as usize, should_cache)?;
+            let read = reader_cache.read_at(lookup, buf, &chunk_view.file_id, offset as usize, chunk_view.chunk_size as usize, should_cache)?;
             if mut_part.last_chunk_fid.is_none() || mut_part.last_chunk_fid.as_ref().unwrap() != &chunk_view.file_id {
                 if let Some(last_chunk_fid) = mut_part.last_chunk_fid.as_ref() {
                     reader_cache.uncache(last_chunk_fid);

@@ -125,11 +125,10 @@ impl InodeToPath {
                     inode += 1;
                 }
             }
+            log::trace!("lookup: insert inode: {}, path: {}", inode, path.to_string_lossy());
+            self.path_to_inode.insert(path.to_path_buf(), inode);
             inode
         };
-
-        log::trace!("lookup: insert inode: {}, path: {}", exists_inode, path.to_string_lossy());
-        self.path_to_inode.insert(path.to_path_buf(), exists_inode);
 
         if let Some(entry) = self.inode_to_path.get_mut(&exists_inode) {
             if is_lookup {
