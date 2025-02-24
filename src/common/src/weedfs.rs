@@ -1,6 +1,6 @@
 use anyhow::Result;
-use crate::pb::{filer_pb::{Entry, FileChunk, FileId, FuseAttributes}, *};
-use std::{collections::HashMap, future::Future, str::FromStr};
+use crate::pb::{filer_pb::{Entry, FileChunk, FileId}, *};
+use std::{collections::HashMap, str::FromStr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -9,36 +9,10 @@ use crate::pb::filer_pb::AssignVolumeRequest;
 use crate::chunks::{self, LookupFileId, UploadChunk};
 use crate::ChunkCache;
 use crate::file::FileHandleOwner;
-use rand::{RngCore, rng, prelude::SliceRandom};
-use std::thread_local;
-use std::cell::RefCell;
-use tokio::runtime::Runtime;
+use crate::runtime::*;
+use rand::prelude::SliceRandom;
 
 
-thread_local! {
-    static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
-}
-
-
-pub fn with_thread_local_runtime<F: Future>(f: F) -> F::Output {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        // log::trace!("using existing tokio runtime");
-        handle.block_on(f)
-    } else {
-        RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                // log::trace!("creating tokio runtime");
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            } else {
-                // log::trace!("using existing created tokio runtime");
-            }
-
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-            runtime.block_on(f)
-        })
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeServerAccess {
@@ -47,16 +21,17 @@ pub enum VolumeServerAccess {
     Url,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WeedfsOption {
     pub filer_addresses: Vec<String>,
     pub chunk_size_limit: usize,
     pub concurrent_writers: usize,
     pub filer_root_path: PathBuf,
+
+    pub ttl: Duration,
    
     pub replication: String,
     pub collection: String,
-    pub ttl: Duration,
     pub disk_type: String,
     pub data_center: String,
 

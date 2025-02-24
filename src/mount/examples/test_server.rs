@@ -26,8 +26,8 @@ fn main() {
         std::path::PathBuf::from(dir)
     };
 
-    let mut option = WfsOption::default();
+    let mut option = FuseWeedfsOption::default();
     option.dir = dir;
     option.allow_others = true;
-    Wfs::mount(option).unwrap();
+    FuseWeedfs::mount(option).unwrap();
 }

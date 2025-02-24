@@ -7,6 +7,7 @@ mod chunk_cache;
 mod interval_list;
 mod reader_cache;
 mod file;
+mod runtime;
 mod weedfs;
 
 pub use chunk_group::ChunkGroup;
@@ -15,4 +16,5 @@ pub use interval_list::*;
 pub use chunk_cache::*;
 pub use reader_cache::*;
 pub use file::*;
+pub use runtime::*;
 pub use weedfs::*;
