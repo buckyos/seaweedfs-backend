@@ -3,14 +3,13 @@ use std::cmp::max;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use dfs_common::pb::{*, filer_pb::Entry};
-use dfs_common::chunks::{self, LookupFileId, UploadChunk};
-use dfs_common::ChunkGroup;
-use dfs_common::ChunkCache;
-use dfs_common::PageWriter;
-use dfs_common::SealedChunkPage;
-
-pub type FileHandleId = u64;
+use crate::pb::{*, filer_pb::Entry};
+use crate::chunks::{self, UploadChunk};
+use crate::ChunkGroup;
+use crate::ChunkCache;
+use crate::PageWriter;
+use crate::SealedChunkPage;
+use crate::weedfs::Weedfs;
 
 struct FileHandleMutPart<C: ChunkCache> {
     entry: Entry,
@@ -20,26 +19,22 @@ struct FileHandleMutPart<C: ChunkCache> {
     unlinked: bool,
 }
 
-pub trait FileHandleOwner: 'static + Clone + ChunkCache + LookupFileId + UploadChunk + Send + Sync {
-    fn chunk_size_limit(&self) -> usize;
-    fn concurrent_writers(&self) -> usize;
-    fn get_path(&self, inode: u64) -> Option<PathBuf>;
-    fn filer_client(&self) -> &FilerClient;
+pub trait FileHandleOwner: 'static + Send + Sync {
+    type FileHandleId: std::fmt::Debug + Send + Sync;
+    fn get_path(&self, id: &Self::FileHandleId) -> Option<PathBuf>;
 }
 
-struct FileHandleInner<T: FileHandleOwner> {
-    fh: FileHandleId,
-    inode: u64, 
-    counter: i64, 
-    owner: T,
-    mut_part: RwLock<FileHandleMutPart<T>>,
+struct FileHandleInner<T: FileHandleOwner, C: ChunkCache> {
+    id: T::FileHandleId, 
+    fs: Weedfs<T, C>,
+    mut_part: RwLock<FileHandleMutPart<C>>,
 }
 
-pub struct FileHandle<T: FileHandleOwner> {
-    inner: Arc<FileHandleInner<T>>,
+pub struct FileHandle<T: FileHandleOwner, C: ChunkCache> {
+    inner: Arc<FileHandleInner<T, C>>,
 }
 
-impl<T: FileHandleOwner> Clone for FileHandle<T> {
+impl<T: FileHandleOwner, C: ChunkCache> Clone for FileHandle<T, C> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -47,49 +42,46 @@ impl<T: FileHandleOwner> Clone for FileHandle<T> {
     }
 }
 
-impl<T: FileHandleOwner> std::fmt::Debug for FileHandle<T> {
+impl<T: FileHandleOwner, C: ChunkCache> std::fmt::Debug for FileHandle<T, C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FileHandle {{ fh: {} }}", self.inner.fh)
+        write!(f, "FileHandle {{ id: {:?} }}", self.inner.id)
     }
 }
 
 
-impl<T: FileHandleOwner> FileHandle<T> {
+impl<T: FileHandleOwner, C: ChunkCache> FileHandle<T, C> {
     pub fn new(
-        owner: T,
-        handle_id: FileHandleId, 
-        inode: u64, 
+        fs: Weedfs<T, C>,
         entry: Entry,
+        id: T::FileHandleId,
     ) -> Result<Self> {        
         let file_size = entry.file_size();
         let mut entry = entry;
         entry.attributes.as_mut().unwrap().file_size = file_size;
-        let chunk_group = ChunkGroup::new(owner.clone());
-        chunk_group.set_chunks(&owner, file_size, entry.chunks.clone())?;
+        let chunk_group = ChunkGroup::new(fs.chunk_cache().clone());
+        chunk_group.set_chunks(&fs, file_size, entry.chunks.clone())?;
       
         Ok(Self {
             inner: Arc::new(FileHandleInner {
-                fh: handle_id,
-                counter: 1,
-                inode,
+                id,
                 mut_part: RwLock::new(FileHandleMutPart {
                     entry,
                     chunk_group,
-                    page_writer: PageWriter::new(handle_id, owner.chunk_size_limit(), owner.concurrent_writers()),
+                    page_writer: PageWriter::new(fs.option().chunk_size_limit, fs.option().concurrent_writers),
                     dirty: false, 
                     unlinked: false,
                 }),
-                owner,
+                fs,
             }),
         })
     }
 
-    pub fn id(&self) -> FileHandleId {
-        self.inner.fh
+    pub fn id(&self) -> &T::FileHandleId {
+        &self.inner.id
     }
 
-    fn owner(&self) -> &T {
-        &self.inner.owner
+    fn fs(&self) -> &Weedfs<T, C> {
+        &self.inner.fs
     }
 
     pub fn rename(&self, name: String) {
@@ -105,7 +97,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
     pub fn update_entry(&self, entry: Entry, update_chunks: bool) -> Result<()> {
         let mut mut_part = self.inner.mut_part.write().unwrap();
         if update_chunks {
-            mut_part.chunk_group.set_chunks(self.owner(), entry.attributes.as_ref().unwrap().file_size, entry.chunks.clone())?;
+            mut_part.chunk_group.set_chunks(self.fs(), entry.attributes.as_ref().unwrap().file_size, entry.chunks.clone())?;
         }
         mut_part.entry = entry;
         mut_part.dirty = true;
@@ -113,7 +105,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
     }
 
     pub fn full_path(&self) -> Option<PathBuf> {
-        self.owner().get_path(self.inner.inode)
+        self.fs().file_owner().get_path(&self.inner.id)
     }
 
     pub fn read(
@@ -136,7 +128,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 let total_read = mut_part.entry.content.len() - offset as usize;
                 (total_read, 0)
             } else {
-                mut_part.chunk_group.read(self.owner(), buff, offset as u64)
+                mut_part.chunk_group.read(self.fs(), buff, offset as u64)
                     .map_err(|e| {
                         log::error!("{:?} read: read from chunk group failed: {}", self, e);
                         e
@@ -169,7 +161,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
                     log::trace!("{:?} upload: sealed index: {}, ts_ns: {}", self, chunk_index, ts_ns);
                     for reader in readers {
                         log::trace!("{:?} upload: sealed index: {}, offset: {}, ts_ns: {}", self, chunk_index, reader.offset, reader.ts_ns);
-                        let chunk = self.owner().upload(full_path.as_path(), &reader.content, reader.offset, reader.ts_ns as i64).await
+                        let chunk = self.fs().upload(full_path.as_path(), &reader.content, reader.offset, reader.ts_ns as i64).await
                             .map_err(|e| {
                                 log::error!("{:?} upload: sealed index: {}, offset: {}, ts_ns: {}, error: {}", self, chunk_index, reader.offset, reader.ts_ns, e);
                                 e
@@ -260,7 +252,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
 
         if mut_part.dirty {
             if let Some(full_path) = self.full_path() {
-                let manifest_chunks = chunks::compact_chunks(self.owner(), self.owner(), full_path.as_path(), mut_part.entry.chunks.clone()).await
+                let manifest_chunks = chunks::compact_chunks(self.fs(), self.fs(), full_path.as_path(), mut_part.entry.chunks.clone()).await
                     .map_err(|e| {
                         log::error!("{:?} flush: compact chunks failed: {}", self, e);
                         anyhow::anyhow!("compact chunks failed: {}", e)
@@ -268,7 +260,7 @@ impl<T: FileHandleOwner> FileHandle<T> {
                 mut_part.entry.chunks = manifest_chunks;
                 log::trace!("{:?} flush: create entry, chunks: {}", self, mut_part.entry.chunks.len());
            
-                self.owner().filer_client().create_entry(&full_path.parent().unwrap(), &mut_part.entry).await
+                self.fs().filer_client().create_entry(&full_path.parent().unwrap(), &mut_part.entry).await
                     .map_err(|e| {
                         log::error!("{:?} flush: create entry failed: {}", self, e);
                         anyhow::anyhow!("create entry failed: {}", e)

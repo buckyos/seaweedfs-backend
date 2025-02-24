@@ -7,7 +7,6 @@ use super::page::{ChunkPage, WritableChunkPage};
 use super::mem::{MemPage, SealedMemPage};
 
 pub struct PageWriter {
-    id: u64, 
     chunk_size: usize,
     writable_chunk_limit: usize,
 
@@ -22,14 +21,13 @@ const MODE_CHANGE_LIMIT: i64 = 3;
 
 impl fmt::Debug for PageWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PageWriter {{ id: {} }}", self.id)
+        write!(f, "PageWriter")
     }
 }
 
 impl PageWriter {
-    pub fn new(id: u64, chunk_size: usize, writable_chunk_limit: usize) -> Self {
+    pub fn new(chunk_size: usize, writable_chunk_limit: usize) -> Self {
         Self {
-            id,
             chunk_size,
             writable_chunk_limit,
             is_sequential_counter: 0,
@@ -200,7 +198,7 @@ mod tests {
     
     #[test]
     fn test_page_writer() {
-        let mut writer = PageWriter::new(0, 2 * 1024 * 1024, 10);
+        let mut writer = PageWriter::new(2 * 1024 * 1024, 10);
         let writes = vec![
             (100, "data at 100"),
             (1000, "data at 1000"),

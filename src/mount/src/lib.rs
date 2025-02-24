@@ -1,7 +1,5 @@
 #![allow(dead_code)]
 extern crate log;
-mod file;
-mod path;
-mod weedfs;
+mod fuse;
 
-pub use weedfs::*;
+pub use fuse::*;

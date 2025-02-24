@@ -10,8 +10,7 @@ use fuser::{
 use libc::{c_int, ENOTEMPTY, ENAMETOOLONG, ENOENT, EIO, EINVAL, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFSOCK};
 use dfs_common::pb::filer_pb::AssignVolumeRequest;
 use dfs_common::chunks::{self, LookupFileId, UploadChunk};
-use dfs_common::{ChunkCache, ChunkCacheInMem};
-use crate::file::{FileHandle, FileHandleId, FileHandleOwner};
+use dfs_common::{ChunkCache, ChunkCacheInMem, FileHandle, FileHandleOwner, Weedfs, WeedfsOption};
 use crate::path::{InodeToPath, ROOT_INODE};
 use rand::{RngCore, rng, prelude::SliceRandom};
 use std::thread_local;
@@ -20,9 +19,6 @@ use tokio::runtime::Runtime;
 use std::os::unix::fs::MetadataExt;
 use futures::stream::StreamExt;
 
-thread_local! {
-    static RUNTIME: RefCell<Option<Runtime>> = RefCell::new(None);
-}
 
 fn check_name(name: &OsStr) -> Option<c_int> {
     if name.len() >= 256 {
@@ -32,70 +28,25 @@ fn check_name(name: &OsStr) -> Option<c_int> {
 }
 
 
-pub fn with_thread_local_runtime<F: Future>(f: F) -> F::Output {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        // log::trace!("using existing tokio runtime");
-        handle.block_on(f)
-    } else {
-        RUNTIME.with(|rt| {
-            if rt.borrow().is_none() {
-                // log::trace!("creating tokio runtime");
-                *rt.borrow_mut() = Some(Runtime::new().expect("Failed to create runtime"));
-            } else {
-                // log::trace!("using existing created tokio runtime");
-            }
-
-            let rt_ref = rt.borrow();
-            let runtime = rt_ref.as_ref().unwrap();
-            runtime.block_on(f)
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolumeServerAccess {
-    FilerProxy,
-    PublicUrl,
-    Url,
-}
-
 #[derive(Debug)]
-pub struct WfsOption {
-    pub filer_addresses: Vec<String>,
-    pub chunk_size_limit: usize,
-    pub concurrent_writers: usize,
+pub struct FuseWeedfsOption {
+    pub weedfs: WeedfsOption,
     pub dir: PathBuf,
     pub dir_auto_create: bool,
-    pub filer_mount_root_path: PathBuf,
     pub umask: u32,
-    pub allow_others: bool,
-
-    pub replication: String,
-    pub collection: String,
-    pub ttl: Duration,
-    pub disk_type: String,
-    pub data_center: String,
-
-    pub volume_server_access: VolumeServerAccess,
+    pub allow_others: bool, 
+    pub block_size: usize,
 }
 
-impl Default for WfsOption {
+impl Default for FuseWeedfsOption {
     fn default() -> Self {
         Self {
-            filer_addresses: vec!["localhost:8888".to_string()],
-            filer_mount_root_path: PathBuf::from("/"),
             dir: PathBuf::from("/"),
             dir_auto_create: true,
-            chunk_size_limit: 2 * 1024 * 1024,
-            concurrent_writers: 32,
-            ttl: Duration::from_secs(0),
-            replication: "".to_string(),
-            collection: "".to_string(),
-            disk_type: "".to_string(),
-            data_center: "".to_string(),
             umask: 0o022,
-            allow_others: false,
-            volume_server_access: VolumeServerAccess::Url,
+            allow_others: false, 
+            block_size: 512,
+            weedfs: WeedfsOption::default(),
         }
     }
 }
@@ -123,39 +74,213 @@ pub enum DirectoryHandle {
 }
 
 
-struct WfsInner {
-    option: WfsOption, 
-    mount_mtime: SystemTime,
-    mount_ctime: SystemTime,
-    mount_mode: u32,
-    mount_uid: u32,
-    mount_gid: u32,
-    filer_client: FilerClient,
-    inode_to_path: RwLock<InodeToPath>,
-    fh_map: RwLock<FileHandleInodeMap>, 
-    dh_map: RwLock<BTreeMap<DirectoryHandleId, Arc<Mutex<DirectoryHandle>>>>,
-    chunk_cache: ChunkCacheInMem, 
-    volume_location_cache: RwLock<HashMap<String, (Vec<String>, Vec<String>)>>,
+
+const ROOT_INODE: u64 = 1;
+
+trait PathExt {
+    fn as_inode(&self, ts_ns: u64) -> u64;
 }
 
-pub struct Wfs {
-    inner: Arc<WfsInner>, 
-}
-
-
-impl Clone for Wfs {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
+impl PathExt for &Path {
+    fn as_inode(&self, ts_secs: u64) -> u64 {
+        let mut hasher = Md5::new();
+        hasher.update(self.to_string_lossy().as_bytes());
+        let hash = hasher.finalize();
+        let hash_bytes: [u8; 8] = hash[..8].try_into().unwrap();
+        u64::from_le_bytes(hash_bytes) + ts_secs * 37
     }
 }
 
-const BLOCK_SIZE: u32 = 512;
+struct InodeEntry {
+    path: Vec<PathBuf>,
+    nlookup: u64,
+    is_directory: bool,
+}
+
+struct InodeToPath {
+    inode_to_path: BTreeMap<u64, InodeEntry>,
+    path_to_inode: HashMap<PathBuf, u64>,
+}
+
+impl InodeToPath {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            inode_to_path: BTreeMap::from([(ROOT_INODE, InodeEntry { path: vec![root.clone()], nlookup: 1, is_directory: true })]),
+            path_to_inode: HashMap::from([(root, ROOT_INODE)]),
+        }
+    }
+
+    fn has_inode(&self, inode: u64) -> bool {
+        self.inode_to_path.contains_key(&inode)
+    }
+
+    fn get_path(&self, inode: u64) -> Option<&Path> {
+        self.inode_to_path.get(&inode).and_then(|entry| entry.path.first().map(|p| p.as_path()))
+    }
+
+    fn move_path(&mut self, old_path: &Path, new_path: &Path) -> (Option<u64>, Option<u64>) {
+        let target_inode = self.path_to_inode.remove(new_path);
+        if let Some(target_inode) = target_inode {
+            self.remove_inode(target_inode);
+        }
+        let source_inode = self.path_to_inode.remove(old_path);
+        if let Some(source_inode) = source_inode {
+            self.path_to_inode.insert(new_path.to_path_buf(), source_inode);
+        } else {
+            return (source_inode, target_inode);
+        }
+        let source_inode = source_inode.unwrap();
+        if let Some(entry) = self.inode_to_path.get_mut(&source_inode) {
+            entry.path.iter_mut().for_each(|p| {
+                if p == old_path {
+                    *p = new_path.to_path_buf();
+                }
+            });
+            if target_inode.is_some() {
+                entry.nlookup += 1;
+            }
+        }
+        (Some(source_inode), target_inode)
+    }
+
+    fn allocate_inode(&self, path: &Path, ts_ns: u64) -> u64 {
+        if path.to_string_lossy() == "/" {
+            return ROOT_INODE;
+        }
+        let mut inode = path.as_inode(ts_ns);
+        while self.inode_to_path.contains_key(&inode) {
+            inode += 1;
+        }
+        inode
+    }
+
+    fn remove_path(&mut self, path: &Path) {
+        if let Some(inode) = self.path_to_inode.remove(path) {
+            self.remove_inode(inode);
+        }
+    }
+
+    fn remove_inode(&mut self, inode: u64) {
+        if let Some(entry) = self.inode_to_path.get_mut(&inode) {
+            entry.path.clear();
+            if entry.path.is_empty() {
+                self.inode_to_path.remove(&inode);
+            }
+        }
+    }
+
+    fn add_path(&mut self, inode: u64, path: PathBuf) {
+        self.path_to_inode.insert(path.clone(), inode);
+        self.inode_to_path.entry(inode).or_insert(InodeEntry { path: vec![], nlookup: 1, is_directory: false })
+            .path.push(path);
+    }
+
+    fn lookup(
+        &mut self, 
+        path: &Path, 
+        ts_secs: u64, 
+        is_directory: bool, 
+        is_hardlink: bool, 
+        possible_inode: u64, 
+        is_lookup: bool
+    ) -> u64 {
+        let exists_inode = if let Some(exists_inode) = self.path_to_inode.get(path).cloned() {
+            exists_inode
+        } else {
+            let mut inode = if possible_inode == 0 {
+                path.as_inode(ts_secs)
+            } else {
+                possible_inode
+            };
+
+            if !is_hardlink {
+                while self.inode_to_path.contains_key(&inode) {
+                    inode += 1;
+                }
+            }
+            log::trace!("lookup: insert inode: {}, path: {}", inode, path.to_string_lossy());
+            self.path_to_inode.insert(path.to_path_buf(), inode);
+            inode
+        };
+
+        if let Some(entry) = self.inode_to_path.get_mut(&exists_inode) {
+            if is_lookup {
+                entry.nlookup += 1;
+            }
+        } else {
+            if !is_lookup {
+                self.inode_to_path.insert(exists_inode, InodeEntry { path: vec![path.to_path_buf()], nlookup: 0, is_directory });
+            } else {
+                self.inode_to_path.insert(exists_inode, InodeEntry { path: vec![path.to_path_buf()], nlookup: 1, is_directory });
+            }
+        }
+
+        exists_inode
+    }
+}
 
 
-impl Wfs {
-    pub fn mount(option: WfsOption) -> Result<()> {
+struct IdProviderInner {
+    inode_to_path: RwLock<InodeToPath>,
+    fh_map: RwLock<FileHandleInodeMap>, 
+    dh_map: RwLock<BTreeMap<DirectoryHandleId, Arc<Mutex<DirectoryHandle>>>>,
+}
+
+#[derive(Clone)]
+struct IdProvider {
+    inner: Arc<IdProviderInner>,
+}
+
+impl IdProvider {
+    fn new(filer_root_path: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(IdProviderInner {
+                inode_to_path: RwLock::new(InodeToPath::new(filer_root_path)),
+                fh_map: RwLock::new(FileHandleInodeMap {
+                    ref_count: BTreeMap::new(),
+                    inode_to_fh: BTreeMap::new(),
+                    fh_to_inode: BTreeMap::new(),
+                }),
+                dh_map: RwLock::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    fn inode_to_path(&self) -> &RwLock<InodeToPath> {
+        &self.inner.inode_to_path
+    }
+
+    fn fh_map(&self) -> &RwLock<FileHandleInodeMap> {
+        &self.inner.fh_map
+    }
+    
+    fn dh_map(&self) -> &RwLock<BTreeMap<DirectoryHandleId, Arc<Mutex<DirectoryHandle>>>> {
+        &self.inner.dh_map
+    }
+}
+
+
+struct FuseId {
+    inode: u64,
+    fh: FileHandleId,
+}
+
+impl FileHandleOwner for IdProvider {
+    type FileHandleId = FuseId;
+    fn get_path(&self, id: &FuseId) -> Option<PathBuf> {
+        self.inner.inode_to_path.read().unwrap().get_path(id.inode)
+    }
+}
+
+
+pub struct FuseWeedfs {
+    option: WeedfsFuseOption, 
+    id_provider: IdProvider,
+    fs: Weedfs<IdProvider, MemChunkCache>,
+}
+
+impl FuseWeedfs {
+    pub fn mount(option: FuseWeedfsOption) -> Result<()> {
         log::info!("Mounting Wfs with option: {:?}", option);
         let path = option.dir.clone(); 
        
@@ -177,7 +302,9 @@ impl Wfs {
         Ok(())
     }
     
-    pub async fn new(option: WfsOption) -> Result<Self> {
+    pub async fn new(option: FuseWeedfsOption) -> Result<Self> {
+        let id_provider = IdProvider::new(option.weedfs.clone());
+
         if option.dir_auto_create && !option.dir.exists() {
             log::info!("Creating directory: {:?}", option.dir);
             std::fs::create_dir_all(&option.dir)
@@ -191,54 +318,36 @@ impl Wfs {
                 log::error!("Failed to get directory metadata: {}", e);
                 e
             })?;
-        
-        let filer_gprc_addresses = option.filer_addresses.clone().into_iter().map(|addr| {
-            let mut parts = addr.split(':');
-            let host = parts.next().unwrap_or("localhost");
-            let port = parts.next().unwrap_or("8888").parse::<u16>().unwrap_or(8888);
-            format!("http://{}:{}", host, port + 10000)
-        }).collect();
-        let filer_client = FilerClient::connect(filer_gprc_addresses).await
-            .map_err(|e| {
-                log::error!("Failed to connect to filer: {}", e);
-                e
-            })?;
-
-        Ok(Self {
-            inner: Arc::new(WfsInner {
-                mount_mode: OS_MODE_DIR | 0o777, 
-                mount_uid: dir_meta.uid(),
-                mount_gid: dir_meta.gid(),
-                mount_mtime: SystemTime::now(), 
-                mount_ctime: dir_meta.modified()?, 
-                filer_client,
-                inode_to_path: RwLock::new(InodeToPath::new(option.filer_mount_root_path.clone())),
-                fh_map: RwLock::new(FileHandleInodeMap {
-                    ref_count: BTreeMap::new(),
-                    inode_to_fh: BTreeMap::new(),
-                    fh_to_inode: BTreeMap::new(),
-                }),
-                dh_map: RwLock::new(BTreeMap::new()),
-                chunk_cache: ChunkCacheInMem::new(1024), 
-                volume_location_cache: RwLock::new(HashMap::new()),
-                option,
+        let root_entry = Entry {
+            name: "".to_string(),
+            is_directory: true,
+            name: "".to_string(),
+            is_directory: true,
+            attributes: Some(FuseAttributes {
+                mtime: self.inner.mount_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                file_mode: self.inner.mount_mode,
+                uid: self.inner.mount_uid,
+                gid: self.inner.mount_gid,
+                crtime: self.inner.mount_ctime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+                ..Default::default()
             }),
+            ..Default::default(),
+        };
+        Ok(Self {
+            fs: Weedfs::new(
+                option.weedfs.clone(), 
+                root_entry, 
+                id_provider.clone(), 
+                ChunkCacheInMem::new(1024)
+            ).await?,
+            id_provider,
+            option,
         })
     }
 
     fn option(&self) -> &WfsOption {
         &self.inner.option
     }
-
-    fn chunk_cache(&self) -> &ChunkCacheInMem {
-        &self.inner.chunk_cache
-    }
-
-    fn filer_client(&self) -> &FilerClient {
-        &self.inner.filer_client
-    }
-
-    
 
     fn get_handle_by_id(&self, id: FileHandleId) -> Option<FileHandle<Self>> {
         let fh_map = self.inner.fh_map.read().unwrap();
@@ -282,94 +391,7 @@ impl Wfs {
         }
     }
 
-    async fn get_entry_by_path(&self, path: &Path) -> Option<Entry> {
-        if path == self.option().filer_mount_root_path {
-            return Some(Entry {
-               name: "".to_string(),
-               is_directory: true,
-               attributes: Some(FuseAttributes {
-                    mtime: self.inner.mount_mtime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    file_mode: self.inner.mount_mode,
-                    uid: self.inner.mount_uid,
-                    gid: self.inner.mount_gid,
-                    crtime: self.inner.mount_ctime.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-                    ..Default::default()
-               }),
-               ..Default::default()
-            });
-        } 
-
-        self.filer_client().lookup_directory_entry(path).await.ok().and_then(|entry| entry)
-    }
-
-    async fn lookup_volume(&self, file_id: &str) -> Result<Vec<String>> {
-        let pulic_url = match self.option().volume_server_access {
-            VolumeServerAccess::FilerProxy => {
-                return Ok(vec![format!("http://{}/?proxyChunkId={}", self.option().filer_addresses[self.filer_client().prefer_address_index()], file_id)]);
-            }, 
-            VolumeServerAccess::PublicUrl => {
-                true
-            }, 
-            VolumeServerAccess::Url => {
-                false
-            },
-        };
-        
-        let file_id = FileId::from_str(file_id)
-            .map_err(|e| {
-                anyhow::anyhow!("invalid file id: {}", e)
-            })?;
-        let vid = file_id.volume_id.to_string();
-        let cached_locations = {
-            let vid_cache = self.inner.volume_location_cache.read().unwrap();
-            if let Some(locations) = vid_cache.get(&vid) {
-                Some(locations.clone())
-            } else {
-                None
-            }
-        };
-
-        let (same_dc_locations, other_locations) = if let Some(locations) = cached_locations {
-            locations
-        } else {
-            let mut locations = self.filer_client().lookup_volume(vec![vid.clone()]).await
-                .map_err(|e| {
-                    anyhow::anyhow!("lookup volume on filer failed: {}", e)
-                })?;
-            if locations.is_empty() {
-                return Err(anyhow::anyhow!("no locations found for volume {}", vid));
-            }
-            let locations = locations.remove(&vid).unwrap();
-            let mut same_dc_locations = Vec::new();
-            let mut other_locations = Vec::new();
-            for location in locations.locations {
-                if location.data_center == self.option().data_center {
-                    if pulic_url {
-                        same_dc_locations.push(location.public_url);
-                    } else {
-                        same_dc_locations.push(location.url);
-                    }
-                } else {
-                    if pulic_url {
-                        other_locations.push(location.public_url);
-                    } else {
-                        other_locations.push(location.url);
-                    }
-                }
-            }
-            self.inner.volume_location_cache.write().unwrap().insert(vid, (same_dc_locations.clone(), other_locations.clone()));
-            (same_dc_locations, other_locations)
-        };
-
-        let mut same_dc_urls: Vec<String> = same_dc_locations.into_iter().map(|location| format!("http://{}/{}", location, file_id.to_string())).collect();
-        same_dc_urls.shuffle(&mut rand::rng());
-        let mut other_urls: Vec<String> = other_locations.into_iter().map(|location| format!("http://{}/{}", location, file_id.to_string())).collect();
-        other_urls.shuffle(&mut rand::rng());
-        
-        let mut urls = same_dc_urls;
-        urls.append(&mut other_urls);
-        Ok(urls)
-    }
+   
 
     async fn list_entries(&self, mut reply: ReplyDirectory, path: PathBuf, fh: DirectoryHandleId, handle: Arc<Mutex<DirectoryHandle>>, start_from: String, is_plus: bool) {
         let mut dh = handle.lock().unwrap();
@@ -464,114 +486,6 @@ impl Wfs {
     }
 }
 
-impl LookupFileId for Wfs {
-    fn lookup(&self, file_id: &str) -> Result<Vec<String>> {
-        with_thread_local_runtime(self.lookup_volume(file_id))
-    }
-}
-
-#[async_trait::async_trait]
-impl UploadChunk for Wfs {
-    async fn upload(
-        &self,
-        full_path: &Path,
-        content: impl Send + Clone + Into<reqwest::Body>, 
-        offset: i64,
-        ts_ns: i64
-    ) -> Result<FileChunk> {
-        let assign_volume_req = AssignVolumeRequest {
-            count: 1,
-            replication: self.option().replication.clone(),
-            collection: self.option().collection.clone(),
-            ttl_sec: self.option().ttl.as_secs() as i32,
-            disk_type: self.option().disk_type.clone(),
-            data_center: self.option().data_center.clone(),
-            rack: "".to_string(),
-            data_node: "".to_string(),
-            path: full_path.to_string_lossy().to_string(),
-        };
-        let assign_volume_resp = self.filer_client().assign_volume(assign_volume_req).await
-            .map_err(|e| {
-                anyhow::anyhow!("assign volume failed: {}", e)
-            })?;
-        let file_id = &assign_volume_resp.file_id;
-        let location = assign_volume_resp.location
-            .ok_or_else(|| anyhow::anyhow!("no location found"))?;
-        
-        log::trace!("path: {}, offset {}, ts: {} assign volume: {}", full_path.to_string_lossy(), offset, ts_ns, file_id);
-        let upload_url = match self.option().volume_server_access {
-            VolumeServerAccess::FilerProxy => {
-                format!("http://{}/?proxyChunkId={}", location.url, file_id)
-            },
-            VolumeServerAccess::PublicUrl => {
-                format!("http://{}/{}", location.public_url, file_id)
-            },
-            VolumeServerAccess::Url => {
-                format!("http://{}/{}", location.url, file_id)
-            },
-        };
-
-        // FIXME: auth, gzip and cipher
-        let result = chunks::retried_upload_chunk(
-            &upload_url, 
-            full_path.file_name().unwrap().to_string_lossy().to_string().as_str(), 
-            content
-        ).await
-            .map_err(|e| {
-                anyhow::anyhow!("upload chunk {} failed: {}", file_id, e)
-            })?;
-        // TODO: insert to chunk cache
-        // if content.offset == 0 {
-        //     self.chunk_cache().set(&assign_volume_resp.file_id, Arc::new());
-        // }
-        Ok(FileChunk {
-            offset: offset,
-            size: result.size.unwrap() as u64,
-            modified_ts_ns: ts_ns,
-            e_tag: result.content_md5.unwrap_or_default(),
-            source_file_id: "".to_string(),
-            fid: FileId::from_str(&assign_volume_resp.file_id).ok(),
-            source_fid: None,
-            cipher_key: result.cipher_key.unwrap_or_default(),
-            is_compressed: result.gzip.unwrap_or(0) > 0,
-            is_chunk_manifest: false,
-            file_id: assign_volume_resp.file_id,
-        })
-    }
-}
-
-impl ChunkCache for Wfs {
-    fn read(&self, data: &mut [u8], file_id: &str, offset: usize) -> std::io::Result<usize> {
-        self.chunk_cache().read(data, file_id, offset)
-    }
-    fn set(&self, file_id: &str, data: Arc<Vec<u8>>) {
-        self.chunk_cache().set(file_id, data);
-    }
-    fn exists(&self, file_id: &str) -> bool {
-        self.chunk_cache().exists(file_id)
-    }
-    fn max_file_part_size(&self) -> u64 {
-        self.chunk_cache().max_file_part_size()
-    }
-}
-
-impl FileHandleOwner for Wfs {
-    fn chunk_size_limit(&self) -> usize {
-        self.option().chunk_size_limit
-    }
-
-    fn concurrent_writers(&self) -> usize {
-        self.option().concurrent_writers
-    }
-
-    fn get_path(&self, inode: u64) -> Option<PathBuf> {
-        self.inner.inode_to_path.read().unwrap().get_path(inode).map(|p| p.to_path_buf())
-    }
-
-    fn filer_client(&self) -> &FilerClient {
-        &self.inner.filer_client
-    }
-}
 
 struct EntryAttr(Entry, u64, bool);
 
@@ -1237,7 +1151,7 @@ impl Filesystem for Wfs {
         }
         log::trace!("lookup: parent: {}, name: {}", parent, name.to_string_lossy());
         let full_path = {
-            let inode_to_path = self.inner.inode_to_path.read().unwrap();
+            let inode_to_path = self.id_provider.inode_to_path().read().unwrap();
             let dir_path = inode_to_path.get_path(parent);
             if dir_path.is_none() {
                 log::trace!("lookup: parent not found, parent: {}", parent);
@@ -1374,7 +1288,7 @@ impl Filesystem for Wfs {
                 } else {
                     let id = rand::random::<u64>();
                     log::trace!("open: ino: {}, id: {}, chunks: {}", ino, id, entry.chunks.len());
-                    let fh = FileHandle::new(self.clone(), id, ino, entry).unwrap();
+                    let fh = FileHandle::new(self.clone(), entry, FuseId { fh: id, inode: ino }).unwrap();
                     fh_map.fh_to_inode.insert(fh.id(), ino);
                     fh_map.ref_count.insert(fh.id(), 1);
                     fh_map.inode_to_fh.insert(ino, fh);
